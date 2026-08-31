@@ -67,6 +67,7 @@ dist/SimpleSlideshow.app/Contents/MacOS/SimpleSlideshow
 ```
 
 ## Project Structure
+```
 SimpleSlideshow/
 ├── build.sh                # Clean and build shell script
 ├── simpleslideshow.py      # Main Application Source Code
@@ -74,3 +75,4 @@ SimpleSlideshow/
 ├── requirements.txt        # Python package dependencies
 ├── Info.plist              # macOS application metadata configuration
 ├── README.md               # Documentation
+```
