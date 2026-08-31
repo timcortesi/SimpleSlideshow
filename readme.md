@@ -64,7 +64,7 @@ chmod +x build.sh
 
 # 7. Test run the built macOS application binary
 dist/SimpleSlideshow.app/Contents/MacOS/SimpleSlideshow
-
+```
 
 ## Project Structure
 SimpleSlideshow/
