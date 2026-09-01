@@ -1,14 +1,17 @@
 import sys
 import os
-import math
+import time
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QFileDialog, 
                              QPushButton, QHBoxLayout, QVBoxLayout, QWidget, 
-                             QSpinBox, QFrame, QMessageBox, QScrollArea, QGridLayout)
-from PyQt6.QtCore import Qt, QTimer, QEvent, QRunnable, QThreadPool, pyqtSignal, QObject
+                             QSpinBox, QFrame, QMessageBox, QScrollArea, QGridLayout,
+                             QSlider)
+from PyQt6.QtCore import Qt, QTimer, QRunnable, QThreadPool, pyqtSignal, QObject, QUrl, QEvent
 from PyQt6.QtGui import QPixmap, QImage
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PIL import Image, ImageOps
 
-# --- Global Thumbnail Memory Cache (Key: file_path_mtime) ---
+# --- Global Thumbnail Memory Cache ---
 THUMBNAIL_CACHE = {}
 MAX_CACHE_SIZE = 1000
 
@@ -17,9 +20,10 @@ class WorkerSignals(QObject):
 
 class ThumbnailWorker(QRunnable):
     """Off-thread image loading and downsampling worker."""
-    def __init__(self, file_path, target_size=(140, 110)):
+    def __init__(self, file_path, is_video=False, target_size=(140, 110)):
         super().__init__()
         self.file_path = file_path
+        self.is_video = is_video
         self.target_size = target_size
         self.signals = WorkerSignals()
 
@@ -31,20 +35,48 @@ class ThumbnailWorker(QRunnable):
             if cache_key in THUMBNAIL_CACHE:
                 self.signals.finished.emit(self.file_path, THUMBNAIL_CACHE[cache_key])
                 return
+            pil_img = None
+            if self.is_video:
+                try:
+                    import cv2
+                    cap = cv2.VideoCapture(self.file_path)
+                    if cap.isOpened():
+                        # Get total duration in milliseconds
+                        fps = cap.get(cv2.CAP_PROP_FPS)
+                        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                        if fps > 0 and total_frames > 0:
+                            duration_ms = (total_frames / fps) * 1000
+                            target_ms = duration_ms * 0.1 # Seek to 10% of the video duration
+                            # Seek to target time
+                            cap.set(cv2.CAP_PROP_POS_MSEC, target_ms)
+                        success, frame = cap.read()
+                        # Fallback to the very first frame if seeking failed
+                        if not success:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            success, frame = cap.read()
+                        cap.release()
+                        if success:
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            pil_img = Image.fromarray(frame_rgb)
+                except Exception:
+                    pil_img = None
+            else:
+                pil_img = Image.open(self.file_path)
+                pil_img = ImageOps.exif_transpose(pil_img)
+            if pil_img:
+                pil_img = pil_img.convert("RGBA")
+                pil_img.thumbnail(self.target_size, Image.Resampling.LANCZOS)
+                data = pil_img.tobytes("raw", "RGBA")
+                qimg = QImage(data, pil_img.width, pil_img.height, QImage.Format.Format_RGBA8888)
+                pixmap = QPixmap.fromImage(qimg)
+            else:
+                pixmap = QPixmap()
 
-            pil_img = Image.open(self.file_path)
-            pil_img = ImageOps.exif_transpose(pil_img).convert("RGBA")
-            pil_img.thumbnail(self.target_size, Image.Resampling.LANCZOS)
-            
-            data = pil_img.tobytes("raw", "RGBA")
-            qimg = QImage(data, pil_img.width, pil_img.height, QImage.Format.Format_RGBA8888)
-            pixmap = QPixmap.fromImage(qimg)
-            
-            # Simple eviction policy if cache grows too large
             if len(THUMBNAIL_CACHE) >= MAX_CACHE_SIZE:
                 THUMBNAIL_CACHE.pop(next(iter(THUMBNAIL_CACHE)))
 
-            THUMBNAIL_CACHE[cache_key] = pixmap
+            if not pixmap.isNull():
+                THUMBNAIL_CACHE[cache_key] = pixmap
             self.signals.finished.emit(self.file_path, pixmap)
         except Exception:
             self.signals.finished.emit(self.file_path, QPixmap())
@@ -65,14 +97,19 @@ class NoFocusSpinBox(QSpinBox):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
 
+class NoFocusSlider(QSlider):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+
 class GalleryItemCard(QFrame):
-    """Unified grid card component for subfolders, parent navigation, and photos."""
     CARD_WIDTH = 180
     CARD_HEIGHT = 180
 
     def __init__(self, item_type, name, path, click_callback=None):
         super().__init__()
-        self.item_type = item_type  # 'folder', 'image', or 'up'
+        self.item_type = item_type  # 'folder', 'image', 'video', or 'up'
         self.name = name
         self.path = path
         self.click_callback = click_callback
@@ -115,7 +152,7 @@ class GalleryItemCard(QFrame):
             icon_label.setStyleSheet("font-size: 44px; border: none; background: transparent;")
             icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(icon_label)
-        elif self.item_type == 'image':
+        elif self.item_type in ('image', 'video'):
             self.img_label = QLabel("⏳")
             self.img_label.setFixedSize(140, 110)
             self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -134,7 +171,7 @@ class GalleryItemCard(QFrame):
                 self.img_label.setPixmap(pixmap)
                 self.img_label.setText("")
             else:
-                self.img_label.setText("🖼️")
+                self.img_label.setText("🎥" if self.item_type == 'video' else "🖼️")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self.click_callback:
@@ -166,17 +203,23 @@ class PhotoSlideshow(QMainWindow):
         self.resize(700, 480)
         self.center_on_screen()
         
-        self.valid_exts = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.heic')
+        self.image_exts = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.heic')
+        self.video_exts = ('.mp4', '.mkv', '.mov', '.avi')
+        self.valid_exts = self.image_exts + self.video_exts
+
         self.root_folder = None
         self.current_folder = None
-        self.image_paths = []
+        self.media_paths = []
         self.current_index = 0
         self.delay_ms = 5000
         self.is_paused = False
         self.grid_cards = []
         self.card_map = {}
 
-        # Thread Pool for background thumbnail rendering
+        # Ramp Tracking State
+        self.last_scrub_time = 0
+        self.scrub_ramp_step = 1.0
+
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(4)
 
@@ -199,11 +242,26 @@ class PhotoSlideshow(QMainWindow):
         self.main_layout = QVBoxLayout(self.central_widget)
         self.main_layout.setContentsMargins(20, 20, 20, 20)
 
-        # Fullscreen Image Player Widget
+        # Fullscreen Image Display
         self.image_label = QLabel(self)
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.main_layout.addWidget(self.image_label)
         self.image_label.hide()
+
+        # Isolated Video Player Widgets
+        self.video_widget = QVideoWidget(self)
+        self.video_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.main_layout.addWidget(self.video_widget)
+        self.video_widget.hide()
+
+        self.player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.player.setAudioOutput(self.audio_output)
+        self.player.setVideoOutput(self.video_widget)
+        
+        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
+        self.player.positionChanged.connect(self.on_video_position_changed)
+        self.player.durationChanged.connect(self.on_video_duration_changed)
 
         self.init_welcome_ui()
         self.init_browser_ui()
@@ -244,27 +302,22 @@ class PhotoSlideshow(QMainWindow):
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(icon_label)
 
-        title = QLabel("Drop Photos or Folders Here")
+        title = QLabel("Drop Media or Folders Here")
         title.setStyleSheet("color: white; font-size: 22px; font-weight: bold; border: none; background: transparent;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
 
-        subtitle = QLabel("Drag & drop images, nested folders, or click below to start")
+        subtitle = QLabel("Drag & drop images, videos, or click below to start")
         subtitle.setStyleSheet("color: #888888; font-size: 13px; border: none; background: transparent;")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(subtitle)
 
-        btn_open = QPushButton("📁 Choose Photo Folder")
+        btn_open = QPushButton("📁 Choose Folder")
         btn_open.setStyleSheet("""
             QPushButton {
-                background-color: #1a73e8;
-                color: white;
-                font-size: 14px;
-                font-weight: bold;
-                padding: 10px 24px;
-                border: none;
-                border-radius: 6px;
-                margin-top: 10px;
+                background-color: #1a73e8; color: white; font-size: 14px;
+                font-weight: bold; padding: 10px 24px; border: none;
+                border-radius: 6px; margin-top: 10px;
             }
             QPushButton:hover { background-color: #1557b0; }
         """)
@@ -288,11 +341,8 @@ class PhotoSlideshow(QMainWindow):
         btn_back = QPushButton("✕ Exit to Dropzone")
         btn_back.setStyleSheet("""
             QPushButton {
-                background-color: #333333;
-                color: white;
-                font-size: 13px;
-                padding: 8px 16px;
-                border-radius: 6px;
+                background-color: #333333; color: white; font-size: 13px;
+                padding: 8px 16px; border-radius: 6px;
             }
             QPushButton:hover { background-color: #ea4335; }
         """)
@@ -319,33 +369,67 @@ class PhotoSlideshow(QMainWindow):
 
     def init_control_panel(self):
         self.controls_widget = QFrame(self)
-        self.controls_widget.setStyleSheet("background-color: rgba(30, 30, 30, 220); border-radius: 8px;")
+        self.controls_widget.setStyleSheet("background-color: rgba(30, 30, 30, 230); border-radius: 8px;")
         
-        layout = QHBoxLayout()
-        layout.setContentsMargins(12, 6, 12, 6)
-        layout.setSpacing(10)
+        v_layout = QVBoxLayout(self.controls_widget)
+        v_layout.setContentsMargins(12, 8, 12, 8)
+        v_layout.setSpacing(6)
+
+        # Video Scrubber Row
+        self.scrubber_container = QWidget()
+        s_layout = QHBoxLayout(self.scrubber_container)
+        s_layout.setContentsMargins(0, 0, 0, 0)
+        s_layout.setSpacing(8)
+
+        self.lbl_video_time = QLabel("0:00 / 0:00")
+        self.lbl_video_time.setStyleSheet("color: #aaa; font-size: 11px; font-weight: bold;")
+        s_layout.addWidget(self.lbl_video_time)
+
+        self.video_slider = NoFocusSlider(Qt.Orientation.Horizontal)
+        self.video_slider.setRange(0, 1000)
+        self.video_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border: none; height: 4px; background: #444; border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #1a73e8; border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #ffffff; border: none; width: 12px; height: 12px;
+                margin: -4px 0; border-radius: 6px;
+            }
+        """)
+        self.video_slider.sliderMoved.connect(self.user_seek_video)
+        s_layout.addWidget(self.video_slider)
+
+        v_layout.addWidget(self.scrubber_container)
+
+        # Controls Row
+        h_layout = QHBoxLayout()
+        h_layout.setContentsMargins(0, 0, 0, 0)
+        h_layout.setSpacing(10)
 
         btn_prev = QPushButton("◄ Back")
         btn_prev.setStyleSheet("color: white; background: #333; padding: 6px 12px; border-radius: 4px;")
-        btn_prev.clicked.connect(self.prev_photo)
+        btn_prev.clicked.connect(self.prev_media)
         btn_prev.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        layout.addWidget(btn_prev)
+        h_layout.addWidget(btn_prev)
 
         self.btn_pause = QPushButton("Pause")
         self.btn_pause.setStyleSheet("color: white; background: #1a73e8; padding: 6px 14px; border-radius: 4px;")
         self.btn_pause.clicked.connect(self.toggle_pause)
         self.btn_pause.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        layout.addWidget(self.btn_pause)
+        h_layout.addWidget(self.btn_pause)
 
         btn_next = QPushButton("Next ►")
         btn_next.setStyleSheet("color: white; background: #333; padding: 6px 12px; border-radius: 4px;")
-        btn_next.clicked.connect(self.next_photo)
+        btn_next.clicked.connect(self.next_media)
         btn_next.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        layout.addWidget(btn_next)
+        h_layout.addWidget(btn_next)
 
-        lbl_delay = QLabel("Delay:")
-        lbl_delay.setStyleSheet("color: #ccc; font-weight: bold;")
-        layout.addWidget(lbl_delay)
+        self.lbl_delay = QLabel("Delay:")
+        self.lbl_delay.setStyleSheet("color: #ccc; font-weight: bold;")
+        h_layout.addWidget(self.lbl_delay)
 
         self.speed_spinbox = NoFocusSpinBox()
         self.speed_spinbox.setRange(1, 60)
@@ -355,31 +439,29 @@ class PhotoSlideshow(QMainWindow):
         self.speed_spinbox.setFixedWidth(52)
         self.speed_spinbox.setStyleSheet("""
             QSpinBox {
-                background-color: #2a2a2a;
-                color: #ffffff;
-                border: 1px solid #444444;
-                border-radius: 4px;
-                padding: 3px 2px;
-                font-weight: bold;
+                background-color: #2a2a2a; color: #ffffff;
+                border: 1px solid #444444; border-radius: 4px;
+                padding: 3px 2px; font-weight: bold;
             }
             QSpinBox::up-button, QSpinBox::down-button { width: 0px; }
         """)
         self.speed_spinbox.valueChanged.connect(self.update_delay_from_spinbox)
-        layout.addWidget(self.speed_spinbox)
+        h_layout.addWidget(self.speed_spinbox)
 
         btn_folder = QPushButton("📁 Gallery")
         btn_folder.setStyleSheet("color: white; background: #444; padding: 6px 12px; border-radius: 4px;")
         btn_folder.clicked.connect(self.exit_slideshow_to_gallery)
         btn_folder.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        layout.addWidget(btn_folder)
+        h_layout.addWidget(btn_folder)
 
         btn_exit = QPushButton("✕ Exit")
         btn_exit.setStyleSheet("color: white; background: #ea4335; padding: 6px 12px; border-radius: 4px;")
         btn_exit.clicked.connect(self.return_to_dropzone)
         btn_exit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        layout.addWidget(btn_exit)
+        h_layout.addWidget(btn_exit)
 
-        self.controls_widget.setLayout(layout)
+        v_layout.addLayout(h_layout)
+
         self.controls_widget.adjustSize()
         self.controls_widget.hide()
 
@@ -391,7 +473,6 @@ class PhotoSlideshow(QMainWindow):
     def reflow_grid(self):
         if not self.grid_cards:
             return
-
         cols = self.get_dynamic_cols()
         for idx, card in enumerate(self.grid_cards):
             row, col = idx // cols, idx % cols
@@ -400,12 +481,12 @@ class PhotoSlideshow(QMainWindow):
     def resizeEvent(self, event):
         self.controls_widget.move(
             (self.width() - self.controls_widget.width()) // 2,
-            int(self.height() * 0.88)
+            int(self.height() * 0.84)
         )
         if self.browser_widget.isVisible():
             self.reflow_grid()
-        elif self.isFullScreen() and self.image_paths and self.image_label.isVisible():
-            self.show_photo()
+        elif self.isFullScreen() and self.media_paths and (self.image_label.isVisible() or self.video_widget.isVisible()):
+            self.show_current_media()
         super().resizeEvent(event)
 
     def handle_app_open_file(self, file_path):
@@ -433,7 +514,6 @@ class PhotoSlideshow(QMainWindow):
     def load_paths(self, paths):
         if not paths:
             return
-
         target_path = paths[0]
         if os.path.isfile(target_path):
             target_path = os.path.dirname(target_path)
@@ -445,9 +525,11 @@ class PhotoSlideshow(QMainWindow):
         self.render_directory(self.root_folder)
 
     def render_directory(self, folder_path):
+        self.stop_video_pipeline()
         self.current_folder = folder_path
         self.welcome_widget.hide()
         self.image_label.hide()
+        self.video_widget.hide()
         self.controls_widget.hide()
 
         self.thread_pool.clear()
@@ -462,7 +544,6 @@ class PhotoSlideshow(QMainWindow):
         self.browser_title.setText(f"📁 {os.path.basename(folder_path) or folder_path}")
 
         items_to_render = []
-
         if self.root_folder and os.path.abspath(folder_path) != os.path.abspath(self.root_folder):
             items_to_render.append(('up', "Back", os.path.dirname(folder_path)))
 
@@ -472,28 +553,30 @@ class PhotoSlideshow(QMainWindow):
             entries = []
 
         subfolders = []
-        direct_images = []
+        direct_files = []
 
         for entry in entries:
             full_path = os.path.join(folder_path, entry)
             if os.path.isdir(full_path):
                 subfolders.append((entry, full_path))
-            elif entry.lower().endswith(self.valid_exts):
-                direct_images.append((entry, full_path))
+            elif entry.lower().endswith(self.image_exts):
+                direct_files.append(('image', entry, full_path))
+            elif entry.lower().endswith(self.video_exts):
+                direct_files.append(('video', entry, full_path))
 
         for name, path in subfolders:
             items_to_render.append(('folder', name, path))
 
-        for name, path in direct_images:
-            items_to_render.append(('image', name, path))
+        for item_type, name, path in direct_files:
+            items_to_render.append((item_type, name, path))
 
         if not items_to_render:
-            QMessageBox.information(self, "Empty Folder", "No photos or subfolders found in this directory.")
+            QMessageBox.information(self, "Empty Folder", "No media files or subfolders found.")
             self.return_to_dropzone()
             return
 
         cols = self.get_dynamic_cols()
-        images_to_load = []
+        media_to_load = []
 
         for idx, (item_type, name, path) in enumerate(items_to_render):
             card = GalleryItemCard(item_type, name, path, self.on_card_clicked)
@@ -501,9 +584,9 @@ class PhotoSlideshow(QMainWindow):
             self.grid_layout.addWidget(card, row, col)
             self.grid_cards.append(card)
 
-            if item_type == 'image':
+            if item_type in ('image', 'video'):
                 self.card_map[path] = card
-                images_to_load.append(path)
+                media_to_load.append((path, item_type == 'video'))
 
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.setStyleSheet("background-color: #121212;")
@@ -513,8 +596,8 @@ class PhotoSlideshow(QMainWindow):
         if self.grid_cards:
             self.grid_cards[0].setFocus()
 
-        for img_path in images_to_load:
-            worker = ThumbnailWorker(img_path)
+        for m_path, is_vid in media_to_load:
+            worker = ThumbnailWorker(m_path, is_video=is_vid)
             worker.signals.finished.connect(self.on_thumbnail_loaded)
             self.thread_pool.start(worker)
 
@@ -525,12 +608,12 @@ class PhotoSlideshow(QMainWindow):
     def on_card_clicked(self, card):
         if card.item_type in ('folder', 'up'):
             self.render_directory(card.path)
-        elif card.item_type == 'image':
-            self.image_paths = [
-                c.path for c in self.grid_cards if c.item_type == 'image'
+        elif card.item_type in ('image', 'video'):
+            self.media_paths = [
+                c.path for c in self.grid_cards if c.item_type in ('image', 'video')
             ]
-            if card.path in self.image_paths:
-                self.current_index = self.image_paths.index(card.path)
+            if card.path in self.media_paths:
+                self.current_index = self.media_paths.index(card.path)
             else:
                 self.current_index = 0
             self.start_slideshow()
@@ -539,16 +622,14 @@ class PhotoSlideshow(QMainWindow):
         self.browser_widget.hide()
         self.welcome_widget.hide()
         self.main_layout.setContentsMargins(0, 0, 0, 0)
-        self.image_label.show()
         self.setStyleSheet("background-color: black;")
         self.showFullScreen()
-        self.setFocus()
         self.show_controls()
-        self.show_photo()
-        self.start_timer()
+        self.show_current_media()
 
     def exit_slideshow_to_gallery(self):
         self.timer.stop()
+        self.stop_video_pipeline()
         if self.current_folder and os.path.exists(self.current_folder):
             self.render_directory(self.current_folder)
         else:
@@ -556,8 +637,10 @@ class PhotoSlideshow(QMainWindow):
 
     def return_to_dropzone(self):
         self.timer.stop()
+        self.stop_video_pipeline()
         self.thread_pool.clear()
         self.image_label.hide()
+        self.video_widget.hide()
         self.controls_widget.hide()
         self.browser_widget.hide()
         self.root_folder = None
@@ -570,44 +653,116 @@ class PhotoSlideshow(QMainWindow):
         self.center_on_screen()
         self.welcome_widget.show()
 
-    def show_photo(self):
-        if not self.image_paths:
+    def stop_video_pipeline(self):
+        if self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
+            self.player.stop()
+        self.player.setSource(QUrl())
+
+    def format_time(self, ms):
+        seconds = max(0, ms // 1000)
+        m, s = divmod(seconds, 60)
+        return f"{m}:{s:02d}"
+
+    def on_video_position_changed(self, pos_ms):
+        dur_ms = self.player.duration()
+        if dur_ms > 0 and not self.video_slider.isSliderDown():
+            val = int((pos_ms / dur_ms) * 1000)
+            self.video_slider.setValue(val)
+            self.lbl_video_time.setText(f"{self.format_time(pos_ms)} / {self.format_time(dur_ms)}")
+
+    def on_video_duration_changed(self, dur_ms):
+        pos_ms = self.player.position()
+        self.lbl_video_time.setText(f"{self.format_time(pos_ms)} / {self.format_time(dur_ms)}")
+
+    def user_seek_video(self, value):
+        dur_ms = self.player.duration()
+        if dur_ms > 0:
+            target_ms = int((value / 1000.0) * dur_ms)
+            self.player.setPosition(target_ms)
+
+    def scrub_video(self, direction_factor):
+        dur_ms = self.player.duration()
+        if dur_ms <= 0:
             return
 
-        path = self.image_paths[self.current_index]
-        try:
-            pil_img = Image.open(path)
-            pil_img = ImageOps.exif_transpose(pil_img).convert("RGBA")
-            
-            win_w, win_h = self.width(), self.height()
-            pil_img.thumbnail((win_w, win_h), Image.Resampling.LANCZOS)
+        now = time.time()
+        time_since_last = now - self.last_scrub_time
+        self.last_scrub_time = now
 
-            qimg = QImage(pil_img.tobytes("raw", "RGBA"), pil_img.width, pil_img.height, QImage.Format.Format_RGBA8888)
-            self.image_label.setPixmap(QPixmap.fromImage(qimg))
-        except Exception as e:
-            print(f"Skipping {path}: {e}")
-            self.next_photo()
+        if time_since_last < 0.4:
+            self.scrub_ramp_step = min(5.0, self.scrub_ramp_step + 1.0)
+        else:
+            self.scrub_ramp_step = 1.0
+
+        delta_ms = int(self.scrub_ramp_step * 1000) * direction_factor
+        new_pos = max(0, min(dur_ms, self.player.position() + delta_ms))
+        self.player.setPosition(new_pos)
+
+    def show_current_media(self):
+        if not self.media_paths:
+            return
+
+        path = self.media_paths[self.current_index]
+        self.timer.stop()
+        self.stop_video_pipeline()
+
+        if path.lower().endswith(self.image_exts):
+            self.video_widget.hide()
+            self.scrubber_container.hide()
+            self.lbl_delay.show()
+            self.speed_spinbox.show()
+            self.image_label.show()
+            try:
+                pil_img = Image.open(path)
+                pil_img = ImageOps.exif_transpose(pil_img).convert("RGBA")
+                
+                win_w, win_h = self.width(), self.height()
+                pil_img.thumbnail((win_w, win_h), Image.Resampling.LANCZOS)
+
+                qimg = QImage(pil_img.tobytes("raw", "RGBA"), pil_img.width, pil_img.height, QImage.Format.Format_RGBA8888)
+                self.image_label.setPixmap(QPixmap.fromImage(qimg))
+                self.start_timer()
+            except Exception as e:
+                print(f"Skipping {path}: {e}")
+                self.next_media()
+
+        elif path.lower().endswith(self.video_exts):
+            self.image_label.hide()
+            self.lbl_delay.hide()
+            self.speed_spinbox.hide()
+            self.scrubber_container.show()
+            self.video_widget.show()
+            
+            self.player.setSource(QUrl.fromLocalFile(path))
+            self.audio_output.setVolume(0.8)
+            self.player.play()
+
+        self.controls_widget.adjustSize()
+        self.setFocus()
+        self.activateWindow()
+
+    def on_media_status_changed(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            if not self.is_paused:
+                self.next_media()
 
     def advance_slideshow(self):
-        if not self.is_paused and self.image_paths:
-            self.current_index = (self.current_index + 1) % len(self.image_paths)
-            self.show_photo()
+        if not self.is_paused and self.media_paths:
+            self.next_media()
 
     def start_timer(self):
         if not self.is_paused:
             self.timer.start(self.delay_ms)
 
-    def next_photo(self):
-        if self.image_paths:
-            self.current_index = (self.current_index + 1) % len(self.image_paths)
-            self.show_photo()
-            self.start_timer()
+    def next_media(self):
+        if self.media_paths:
+            self.current_index = (self.current_index + 1) % len(self.media_paths)
+            self.show_current_media()
 
-    def prev_photo(self):
-        if self.image_paths:
-            self.current_index = (self.current_index - 1) % len(self.image_paths)
-            self.show_photo()
-            self.start_timer()
+    def prev_media(self):
+        if self.media_paths:
+            self.current_index = (self.current_index - 1) % len(self.media_paths)
+            self.show_current_media()
 
     def toggle_pause(self):
         self.is_paused = not self.is_paused
@@ -616,14 +771,22 @@ class PhotoSlideshow(QMainWindow):
             "color: white; background: #34a853; padding: 6px 14px; border-radius: 4px;" if self.is_paused 
             else "color: white; background: #1a73e8; padding: 6px 14px; border-radius: 4px;"
         )
-        if self.is_paused:
-            self.timer.stop()
+
+        path = self.media_paths[self.current_index] if self.media_paths else ""
+        if path.lower().endswith(self.video_exts):
+            if self.is_paused:
+                self.player.pause()
+            else:
+                self.player.play()
         else:
-            self.start_timer()
+            if self.is_paused:
+                self.timer.stop()
+            else:
+                self.start_timer()
 
     def update_delay_from_spinbox(self, val):
         self.delay_ms = val * 1000
-        if not self.is_paused and self.image_paths:
+        if not self.is_paused and self.image_label.isVisible():
             self.start_timer()
 
     def adjust_speed(self, delta):
@@ -632,7 +795,8 @@ class PhotoSlideshow(QMainWindow):
             self.speed_spinbox.setValue(new_val)
 
     def mouseMoveEvent(self, event):
-        if self.isFullScreen() and self.image_label.isVisible():
+        in_slideshow = self.isFullScreen() and (self.image_label.isVisible() or self.video_widget.isVisible())
+        if in_slideshow:
             self.show_controls()
         super().mouseMoveEvent(event)
 
@@ -642,12 +806,16 @@ class PhotoSlideshow(QMainWindow):
         self.hide_timer.start(3000)
 
     def hide_controls(self):
-        if self.isFullScreen() and self.image_label.isVisible():
+        in_slideshow = self.isFullScreen() and (self.image_label.isVisible() or self.video_widget.isVisible())
+        if in_slideshow:
             self.controls_widget.hide()
 
     def keyPressEvent(self, event):
         key = event.key()
+        modifiers = event.modifiers()
+        is_cmd = bool(modifiers & Qt.KeyboardModifier.ControlModifier) or bool(modifiers & Qt.KeyboardModifier.MetaModifier)
 
+        # 1. Gallery View Grid Navigation
         if self.browser_widget.isVisible() and self.grid_cards:
             focused = self.focusWidget()
             if isinstance(focused, GalleryItemCard):
@@ -673,20 +841,33 @@ class PhotoSlideshow(QMainWindow):
                         self.return_to_dropzone()
                 return
 
-        if self.isFullScreen() and self.image_label.isVisible():
+        # 2. Presentation / Slideshow Mode Navigation
+        in_slideshow = self.isFullScreen() and (self.image_label.isVisible() or self.video_widget.isVisible())
+        if in_slideshow:
             if key in (Qt.Key.Key_Right, Qt.Key.Key_Left, Qt.Key.Key_Space, Qt.Key.Key_Up, Qt.Key.Key_Down):
                 self.show_controls()
 
+            current_path = self.media_paths[self.current_index] if self.media_paths else ""
+            is_video = current_path.lower().endswith(self.video_exts)
+
             if key == Qt.Key.Key_Right:
-                self.next_photo()
+                if is_video and is_cmd:
+                    self.scrub_video(1)
+                else:
+                    self.next_media()
             elif key == Qt.Key.Key_Left:
-                self.prev_photo()
+                if is_video and is_cmd:
+                    self.scrub_video(-1)
+                else:
+                    self.prev_media()
             elif key == Qt.Key.Key_Space:
                 self.toggle_pause()
             elif key == Qt.Key.Key_Up:
-                self.adjust_speed(1)
+                if not is_video:
+                    self.adjust_speed(1)
             elif key == Qt.Key.Key_Down:
-                self.adjust_speed(-1)
+                if not is_video:
+                    self.adjust_speed(-1)
             elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace):
                 self.exit_slideshow_to_gallery()
             else:
