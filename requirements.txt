@@ -1,3 +1,4 @@
 pillow
 pyinstaller
 PyQt6
+opencv-python
