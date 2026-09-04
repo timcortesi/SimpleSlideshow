@@ -141,9 +141,11 @@ final class AppState: ObservableObject {
         setFullScreen(true)
     }
     
-    private func parseDirectory(_ target: URL) {
+    private func parseDirectory(_ target: URL, resetIndex: Bool = true) {
         self.items = []
-        self.selectedIndex = 0
+        if resetIndex {
+            self.selectedIndex = 0
+        }
         self.currentFolder = target
         
         let keys: [URLResourceKey] = [.isDirectoryKey]
@@ -184,7 +186,11 @@ final class AppState: ObservableObject {
         combinedItems.append(contentsOf: mediaItems)
         
         self.items = combinedItems
-        self.selectedIndex = 0
+        if resetIndex {
+            self.selectedIndex = 0
+        } else {
+            self.selectedIndex = min(max(0, self.selectedIndex), max(0, self.items.count - 1))
+        }
         setFullScreen(true)
     }
     
@@ -226,14 +232,16 @@ final class AppState: ObservableObject {
         timer?.invalidate()
         resetVideoState()
         NSCursor.unhide()
-        if currentFolder != nil {
+        
+        // Refresh folder contents without resetting the selectedIndex so we stay on the current item
+        if let folder = currentFolder {
+            parseDirectory(folder, resetIndex: false)
             setFullScreen(true)
         } else {
             setFullScreen(false)
         }
     }
     
-    // Slideshow item traversal
     func moveSlideshowSelection(by delta: Int) {
         guard !items.isEmpty else { return }
         triggerControls()
@@ -249,7 +257,6 @@ final class AppState: ObservableObject {
         resetTimer()
     }
     
-    // Rock-solid 2D Grid navigation (no row wrapping on left/right)
     func moveGridSelection(horizontal: Int = 0, vertical: Int = 0) {
         guard !items.isEmpty else { return }
         triggerControls()
@@ -512,7 +519,7 @@ struct DropzoneView: View {
             .controlSize(.large)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(NSColor.windowBackgroundColor))
+        .background(Color.black)
         .onHover { hovering in
             if hovering { NSCursor.arrow.set() }
         }
@@ -649,7 +656,10 @@ struct GalleryView: View {
                         .padding()
                     }
                     .id(state.currentFolder)
-                    .onAppear { state.gridColumnsCount = cols }
+                    .onAppear {
+                        state.gridColumnsCount = cols
+                        proxy.scrollTo(state.selectedIndex, anchor: .center)
+                    }
                     .onChange(of: cols) { _, newCols in state.gridColumnsCount = newCols }
                     .onChange(of: state.selectedIndex) { _, newIndex in
                         withAnimation { proxy.scrollTo(newIndex, anchor: .center) }
@@ -926,6 +936,9 @@ struct ContentView: View {
                 }
                 return .handled
                 
+            case .tab:
+                return .ignored
+                
             default:
                 return .ignored
             }
@@ -942,6 +955,7 @@ struct SimpleSlideshowApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(state: state)
+                .preferredColorScheme(.dark)
                 .onAppear {
                     appDelegate.onOpenURL = { url in
                         Task { @MainActor in
