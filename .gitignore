@@ -1,4 +1,5 @@
-/build
-/dist
-/myenv
+/python/build
+/python/dist
+/python/myenv
 .DS_Store
+Simple Slideshow.app

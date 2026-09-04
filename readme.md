@@ -1,19 +1,19 @@
 # SimpleSlideshow
 
-A lightweight, distraction-free, full-screen photo slideshow viewer for macOS. Built with Python, PyQt6, and Pillow, and packaged into a native macOS app bundle via PyInstaller.
+A lightweight, distraction-free, native macOS photo and video slideshow viewer built with SwiftUI and AppKit. 
 
 ---
 
 ## Key Features
 
-- **Full-Screen Playback:** Launches natively in borderless full-screen mode with auto-hiding navigation controls.
-- **EXIF Auto-Rotation:** Leverages Pillow (`ImageOps.exif_transpose`) to correctly rotate images taken on modern camera and smartphone orientation sensors.
-- **Multi-Format Support:** Compatible with `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`, and `.heic` image formats.
+- **Full-Screen Playback:** Launches natively with auto-hiding controls and a clean, distraction-free interface.
+- **Rich Media Support:** Seamlessly handles both images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`, `.heic`, `.tiff`) and videos (`.mp4`, `.mkv`, `.mov`, `.avi`).
+- **Interactive Gallery & Grid Navigation:** Browse folders visually with high-performance async thumbnails, clean 2D grid arrow navigation, and built-in folder traversal.
+- **Robust Video Controls:** Precise scrubbing timeline, play/pause states, and fast-forward/rewind keyboard shortcuts for video playback.
 - **Flexible File Ingestion:**
-  - Drag and drop files or folders directly into the running application window.
-  - Drag files or folders directly onto the application icon in macOS Finder/Dock.
-  - Choose folders via a native macOS file dialog.
-- **Keyboard Shortcuts & On-Screen Controls:** Complete control over playback, frame progression, and transition delays using hotkeys or overlay GUI controls.
+  - Drag and drop files or folders directly into the dropzone or running app window.
+  - Open files directly from macOS Finder/Dock.
+  - Choose folders via a native macOS dialog.
 
 ---
 
@@ -22,57 +22,20 @@ A lightweight, distraction-free, full-screen photo slideshow viewer for macOS. B
 | Key | Action |
 | :--- | :--- |
 | **`Space`** | Play / Pause slideshow |
-| **`Right Arrow (→)`** | Next photo |
-| **`Left Arrow (←)`** | Decrease photo index (Previous photo) |
-| **`Up Arrow (↑)`** | Increase slide delay (+1 sec) |
-| **`Down Arrow (↓)`** | Decrease slide delay (-1 sec) |
-| **`Escape`** | Exit Application |
+| **`Right / Left Arrows (→ / ←)`** | Next / Previous item (strictly within row boundaries) |
+| **`Up / Down Arrows (↑ / ↓)`** | Move up/down grid rows, or adjust slideshow delay / video seek |
+| **`Cmd + Right / Left`** | Fast-forward / Rewind active video |
+| **`Return`** | Open selected folder or start slideshow |
+| **`Escape`** | Exit slideshow / Go back a folder / Exit app |
 
 ---
-
-## Prerequisites
-
-- **macOS**
-- **Python 3.10+** (specifically built with Homebrew's Python 3.14)
-
----
-
-## Complete Setup, Development & Build Guide
-
-Run these commands in order from your terminal to go from setup to a fully compiled macOS `.app` bundle:
-
-```bash
-# 1. Navigate to the project directory
-cd SimpleSlideshow
-
-# 2. Create the virtual environment
-/opt/homebrew/opt/python@3.14/bin/python3.14 -m venv myenv
-
-# 3. Activate the virtual environment
-source myenv/bin/activate
-
-# 4. Install dependencies
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# 5. (Optional) Run and test from source code directly
-python simpleslideshow.py
-
-# 6. Make the build script executable and compile the .app bundle
-chmod +x build.sh
-./build.sh
-
-# 7. Test run the built macOS application binary
-dist/SimpleSlideshow.app/Contents/MacOS/SimpleSlideshow
-```
 
 ## Project Structure
-```
+```text
 SimpleSlideshow/
-├── build.sh                # Clean and build shell script
-├── simpleslideshow.py      # Main Application Source Code
-├── simpleslideshow.spec    # PyInstaller specification configuration
-├── requirements.txt        # Python package dependencies
-├── Info.plist              # macOS application metadata configuration
-├── README.md               # Documentation
-```
+├── Simple Slideshow.app/   # Compiled macOS Application Bundle
+├── main.swift              # Main SwiftUI & AppKit Source Code
+├── build.sh                # Build and compilation script
+├── app_icon.icns           # macOS Application Icon
+├── app_icon.png            # Source Icon Image
+└── Info.plist              # macOS application metadata configuration

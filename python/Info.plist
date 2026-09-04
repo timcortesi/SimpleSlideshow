@@ -7,15 +7,11 @@
     <key>CFBundleIdentifier</key>
     <string>com.simpleslideshow.app</string>
     <key>CFBundleName</key>
-    <string>Simple Slideshow</string>
-    <key>CFBundleDisplayName</key>
-    <string>Simple Slideshow</string>
+    <string>SimpleSlideshow</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
-    <key>CFBundleIconFile</key>
-    <string>app_icon.icns</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>
@@ -31,3 +27,4 @@
     </array>
 </dict>
 </plist>
+
