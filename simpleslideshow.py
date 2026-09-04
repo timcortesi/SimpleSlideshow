@@ -4,7 +4,7 @@ import time
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QFileDialog, 
                              QPushButton, QHBoxLayout, QVBoxLayout, QWidget, 
                              QSpinBox, QFrame, QMessageBox, QScrollArea, QGridLayout,
-                             QSlider)
+                             QSlider, QProgressBar)
 from PyQt6.QtCore import Qt, QTimer, QRunnable, QThreadPool, pyqtSignal, QObject, QUrl, QEvent
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -35,22 +35,20 @@ class ThumbnailWorker(QRunnable):
             if cache_key in THUMBNAIL_CACHE:
                 self.signals.finished.emit(self.file_path, THUMBNAIL_CACHE[cache_key])
                 return
+            
             pil_img = None
             if self.is_video:
                 try:
                     import cv2
                     cap = cv2.VideoCapture(self.file_path)
                     if cap.isOpened():
-                        # Get total duration in milliseconds
                         fps = cap.get(cv2.CAP_PROP_FPS)
                         total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
                         if fps > 0 and total_frames > 0:
                             duration_ms = (total_frames / fps) * 1000
-                            target_ms = duration_ms * 0.1 # Seek to 10% of the video duration
-                            # Seek to target time
+                            target_ms = duration_ms * 0.1
                             cap.set(cv2.CAP_PROP_POS_MSEC, target_ms)
                         success, frame = cap.read()
-                        # Fallback to the very first frame if seeking failed
                         if not success:
                             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                             success, frame = cap.read()
@@ -63,6 +61,7 @@ class ThumbnailWorker(QRunnable):
             else:
                 pil_img = Image.open(self.file_path)
                 pil_img = ImageOps.exif_transpose(pil_img)
+
             if pil_img:
                 pil_img = pil_img.convert("RGBA")
                 pil_img.thumbnail(self.target_size, Image.Resampling.LANCZOS)
@@ -109,7 +108,7 @@ class GalleryItemCard(QFrame):
 
     def __init__(self, item_type, name, path, click_callback=None):
         super().__init__()
-        self.item_type = item_type  # 'folder', 'image', 'video', or 'up'
+        self.item_type = item_type
         self.name = name
         self.path = path
         self.click_callback = click_callback
@@ -248,7 +247,7 @@ class PhotoSlideshow(QMainWindow):
         self.main_layout.addWidget(self.image_label)
         self.image_label.hide()
 
-        # Isolated Video Player Widgets
+        # Video Player Widgets
         self.video_widget = QVideoWidget(self)
         self.video_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.main_layout.addWidget(self.video_widget)
@@ -371,6 +370,10 @@ class PhotoSlideshow(QMainWindow):
         self.controls_widget = QFrame(self)
         self.controls_widget.setStyleSheet("background-color: rgba(30, 30, 30, 230); border-radius: 8px;")
         
+        # Explicit Native Compositor Binding
+        self.controls_widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.controls_widget.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+
         v_layout = QVBoxLayout(self.controls_widget)
         v_layout.setContentsMargins(12, 8, 12, 8)
         v_layout.setSpacing(6)
@@ -448,12 +451,6 @@ class PhotoSlideshow(QMainWindow):
         self.speed_spinbox.valueChanged.connect(self.update_delay_from_spinbox)
         h_layout.addWidget(self.speed_spinbox)
 
-        btn_folder = QPushButton("📁 Gallery")
-        btn_folder.setStyleSheet("color: white; background: #444; padding: 6px 12px; border-radius: 4px;")
-        btn_folder.clicked.connect(self.exit_slideshow_to_gallery)
-        btn_folder.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        h_layout.addWidget(btn_folder)
-
         btn_exit = QPushButton("✕ Exit")
         btn_exit.setStyleSheet("color: white; background: #ea4335; padding: 6px 12px; border-radius: 4px;")
         btn_exit.clicked.connect(self.return_to_dropzone)
@@ -462,8 +459,40 @@ class PhotoSlideshow(QMainWindow):
 
         v_layout.addLayout(h_layout)
 
+        # Progress bar overlay with native rendering pass-through
+        self.video_progress_bar = QProgressBar(self)
+        self.video_progress_bar.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.video_progress_bar.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+        self.video_progress_bar.setRange(0, 1000)
+        self.video_progress_bar.setTextVisible(False)
+        self.video_progress_bar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.video_progress_bar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.video_progress_bar.setStyleSheet("""
+            QProgressBar {
+                background: rgba(255, 255, 255, 30);
+                border: none;
+                height: 4px;
+                border-radius: 8px;
+            }
+            QProgressBar::chunk {
+                background-color: #1a73e8;
+                border-radius: 8px;
+            }
+        """)
+        self.video_progress_bar.hide()
+
         self.controls_widget.adjustSize()
         self.controls_widget.hide()
+
+    def update_overlay_geometry(self):
+        p_width = self.width()
+        p_height = self.height()
+
+        self.controls_widget.move(
+            (p_width - self.controls_widget.width()) // 2,
+            int(p_height * 0.84)
+        )
+        self.video_progress_bar.setGeometry(0, p_height - 4, p_width, 4)
 
     def get_dynamic_cols(self):
         available_width = self.scroll_area.viewport().width() - 80
@@ -479,10 +508,7 @@ class PhotoSlideshow(QMainWindow):
             self.grid_layout.addWidget(card, row, col)
 
     def resizeEvent(self, event):
-        self.controls_widget.move(
-            (self.width() - self.controls_widget.width()) // 2,
-            int(self.height() * 0.84)
-        )
+        self.update_overlay_geometry()
         if self.browser_widget.isVisible():
             self.reflow_grid()
         elif self.isFullScreen() and self.media_paths and (self.image_label.isVisible() or self.video_widget.isVisible()):
@@ -531,6 +557,7 @@ class PhotoSlideshow(QMainWindow):
         self.image_label.hide()
         self.video_widget.hide()
         self.controls_widget.hide()
+        self.video_progress_bar.hide()
 
         self.thread_pool.clear()
 
@@ -642,6 +669,7 @@ class PhotoSlideshow(QMainWindow):
         self.image_label.hide()
         self.video_widget.hide()
         self.controls_widget.hide()
+        self.video_progress_bar.hide()
         self.browser_widget.hide()
         self.root_folder = None
         self.current_folder = None
@@ -665,10 +693,12 @@ class PhotoSlideshow(QMainWindow):
 
     def on_video_position_changed(self, pos_ms):
         dur_ms = self.player.duration()
-        if dur_ms > 0 and not self.video_slider.isSliderDown():
+        if dur_ms > 0:
             val = int((pos_ms / dur_ms) * 1000)
-            self.video_slider.setValue(val)
-            self.lbl_video_time.setText(f"{self.format_time(pos_ms)} / {self.format_time(dur_ms)}")
+            if not self.video_slider.isSliderDown():
+                self.video_slider.setValue(val)
+                self.lbl_video_time.setText(f"{self.format_time(pos_ms)} / {self.format_time(dur_ms)}")
+            self.video_progress_bar.setValue(val)
 
     def on_video_duration_changed(self, dur_ms):
         pos_ms = self.player.position()
@@ -708,6 +738,7 @@ class PhotoSlideshow(QMainWindow):
 
         if path.lower().endswith(self.image_exts):
             self.video_widget.hide()
+            self.video_progress_bar.hide()
             self.scrubber_container.hide()
             self.lbl_delay.show()
             self.speed_spinbox.show()
@@ -738,6 +769,7 @@ class PhotoSlideshow(QMainWindow):
             self.player.play()
 
         self.controls_widget.adjustSize()
+        self.update_overlay_geometry()
         self.setFocus()
         self.activateWindow()
 
@@ -801,14 +833,22 @@ class PhotoSlideshow(QMainWindow):
         super().mouseMoveEvent(event)
 
     def show_controls(self):
+        self.update_overlay_geometry()
         self.controls_widget.show()
         self.controls_widget.raise_()
+
+        current_path = self.media_paths[self.current_index] if self.media_paths else ""
+        if current_path.lower().endswith(self.video_exts):
+            self.video_progress_bar.show()
+            self.video_progress_bar.raise_()
+
         self.hide_timer.start(3000)
 
     def hide_controls(self):
         in_slideshow = self.isFullScreen() and (self.image_label.isVisible() or self.video_widget.isVisible())
         if in_slideshow:
             self.controls_widget.hide()
+            self.video_progress_bar.hide()
 
     def keyPressEvent(self, event):
         key = event.key()
