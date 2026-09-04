@@ -73,11 +73,17 @@ actor ImageLoader {
     }
 }
 
+// MARK: - Navigation History State
+struct FolderState {
+    let url: URL
+    var selectedIndex: Int
+}
+
 // MARK: - App State
 @MainActor
 final class AppState: ObservableObject {
     @Published var currentFolder: URL?
-    @Published var folderHistory: [URL] = []
+    @Published var folderHistory: [FolderState] = []
     @Published var items: [MediaItem] = []
     @Published var selectedIndex: Int = 0
     @Published var isSlideshowActive: Bool = false
@@ -120,11 +126,11 @@ final class AppState: ObservableObject {
         if fileExists && !isDir.boolValue {
             target = url.deletingLastPathComponent()
             
-            if pushHistory, let current = currentFolder, current != target {
-                folderHistory.append(current)
+            if pushHistory, let current = currentFolder {
+                folderHistory.append(FolderState(url: current, selectedIndex: selectedIndex))
             }
             
-            parseDirectory(target)
+            parseDirectory(target, resetIndex: true)
             
             if let matchedIndex = items.firstIndex(where: { $0.url.standardizedFileIOPassed == url.standardizedFileIOPassed }) {
                 selectedIndex = matchedIndex
@@ -133,11 +139,11 @@ final class AppState: ObservableObject {
             return
         }
         
-        if pushHistory, let current = currentFolder, current != target {
-            folderHistory.append(current)
+        if pushHistory, let current = currentFolder {
+            folderHistory.append(FolderState(url: current, selectedIndex: selectedIndex))
         }
         
-        parseDirectory(target)
+        parseDirectory(target, resetIndex: true)
         setFullScreen(true)
     }
     
@@ -196,8 +202,9 @@ final class AppState: ObservableObject {
     
     func navigateBack() {
         NSCursor.unhide()
-        if let previous = folderHistory.popLast() {
-            loadDirectory(previous, pushHistory: false)
+        if let previousState = folderHistory.popLast() {
+            parseDirectory(previousState.url, resetIndex: false)
+            selectedIndex = min(max(0, previousState.selectedIndex), max(0, items.count - 1))
         } else {
             currentFolder = nil
             items = []
@@ -233,7 +240,6 @@ final class AppState: ObservableObject {
         resetVideoState()
         NSCursor.unhide()
         
-        // Refresh folder contents without resetting the selectedIndex so we stay on the current item
         if let folder = currentFolder {
             parseDirectory(folder, resetIndex: false)
             setFullScreen(true)
@@ -242,9 +248,11 @@ final class AppState: ObservableObject {
         }
     }
     
-    func moveSlideshowSelection(by delta: Int) {
+    func moveSlideshowSelection(by delta: Int, userInitiated: Bool = true) {
         guard !items.isEmpty else { return }
-        triggerControls()
+        if userInitiated {
+            triggerControls()
+        }
         resetVideoState()
         
         var newIndex = selectedIndex + delta
@@ -315,7 +323,7 @@ final class AppState: ObservableObject {
         guard isSlideshowActive, !isPaused, let current = selectedItem, !current.isVideo else { return }
         timer = Timer.scheduledTimer(withTimeInterval: TimeInterval(delaySeconds), repeats: false) { [weak self] _ in
             Task { @MainActor in
-                self?.moveSlideshowSelection(by: 1)
+                self?.moveSlideshowSelection(by: 1, userInitiated: false)
             }
         }
     }
@@ -662,7 +670,7 @@ struct GalleryView: View {
                     }
                     .onChange(of: cols) { _, newCols in state.gridColumnsCount = newCols }
                     .onChange(of: state.selectedIndex) { _, newIndex in
-                        withAnimation { proxy.scrollTo(newIndex, anchor: .center) }
+                        proxy.scrollTo(newIndex, anchor: .center)
                     }
                 }
             }
@@ -704,7 +712,7 @@ struct SlideshowView: View {
                         duration: $state.videoDuration,
                         scrubTargetTime: $state.scrubTargetTime,
                         onEnd: {
-                            state.moveSlideshowSelection(by: 1)
+                            state.moveSlideshowSelection(by: 1, userInitiated: false)
                         }
                     )
                     .id(current.url)
