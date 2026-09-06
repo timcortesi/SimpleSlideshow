@@ -4,9 +4,23 @@ import QuickLookThumbnailing
 import AppKit
 import UniformTypeIdentifiers
 
+// MARK: - Window Layout Configuration Model
+struct WindowLayoutSpec {
+    let width: CGFloat
+    let height: CGFloat
+    let isResizable: Bool
+}
+
+enum WindowInteractionMode {
+    case dropzone
+    case browser
+    case slideshow
+}
+
 // MARK: - App Delegate & File Open Handling
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var onOpenURL: ((URL) -> Void)?
+    var onFullScreenChange: ((Bool) -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -15,13 +29,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let window = NSApp.windows.first {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
-            window.backgroundColor = .black
+            window.backgroundColor = .windowBackgroundColor
+            window.delegate = self
+            let spec = AppState.spec(for: .dropzone)
+            window.setContentSize(NSSize(width: spec.width, height: spec.height))
+            window.styleMask.remove(.resizable)
+        }
+        
+        NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { _ in
+            NSCursor.unhide()
         }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let url = urls.first else { return }
         onOpenURL?(url)
+    }
+    
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        onFullScreenChange?(true)
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        onFullScreenChange?(false)
     }
 }
 
@@ -44,7 +74,10 @@ final class ThumbnailCache {
 // MARK: - Async Thumbnail & Image Loader
 actor ImageLoader {
     static func loadThumbnail(for item: MediaItem, size: CGSize) async -> NSImage? {
-        let key = NSString(string: item.url.path)
+        let parentDir = item.url.deletingLastPathComponent().lastPathComponent
+        let cacheKeyString = "\(parentDir)_\(item.name)"
+        let key = NSString(string: cacheKeyString)
+        
         if let cached = ThumbnailCache.shared.object(forKey: key) {
             return cached
         }
@@ -57,12 +90,25 @@ actor ImageLoader {
             representationTypes: .thumbnail
         )
         
+        let ext = item.url.pathExtension.lowercased()
+        let validImageExts = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "heic", "tiff"]
+        let validVideoExts = ["mp4", "mkv", "mov", "avi"]
+        
         do {
             let representation = try await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
             let image = representation.nsImage
             ThumbnailCache.shared.setObject(image, forKey: key)
             return image
         } catch {
+            if !validImageExts.contains(ext) && !validVideoExts.contains(ext) {
+                return nil
+            }
+            
+            if validImageExts.contains(ext), let fullImage = loadFullImage(from: item.url) {
+                ThumbnailCache.shared.setObject(fullImage, forKey: key)
+                return fullImage
+            }
+            
             return nil
         }
     }
@@ -92,6 +138,8 @@ final class AppState: ObservableObject {
     @Published var gridColumnsCount: Int = 3
     @Published var seekTrigger: (direction: Int, count: Int)? = nil
     @Published var showControlsSignal: Bool = false
+    @Published var isDarkMode: Bool
+    @Published var isFullScreen: Bool = false
     
     // Video Progress Tracking
     @Published var videoCurrentTime: Double = 0
@@ -103,9 +151,23 @@ final class AppState: ObservableObject {
     private var lastSeekTime: Date = Date()
     private var seekAcceleration: Int = 1
     
+    init() {
+        let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        self.isDarkMode = isDark
+    }
+    
     var selectedItem: MediaItem? {
         guard items.indices.contains(selectedIndex) else { return nil }
         return items[selectedIndex]
+    }
+    
+    static func spec(for mode: WindowInteractionMode) -> WindowLayoutSpec {
+        switch mode {
+        case .dropzone:
+            return WindowLayoutSpec(width: 400, height: 400, isResizable: false)
+        case .browser, .slideshow:
+            return WindowLayoutSpec(width: 1120, height: 776, isResizable: true)
+        }
     }
     
     func resetVideoState() {
@@ -118,6 +180,8 @@ final class AppState: ObservableObject {
     
     func loadDirectory(_ url: URL, pushHistory: Bool = true) {
         NSCursor.unhide()
+        updateWindowForMode(.browser)
+        
         var target = url
         var isDir: ObjCBool = false
         
@@ -144,7 +208,6 @@ final class AppState: ObservableObject {
         }
         
         parseDirectory(target, resetIndex: true)
-        setFullScreen(true)
     }
     
     private func parseDirectory(_ target: URL, resetIndex: Bool = true) {
@@ -197,7 +260,6 @@ final class AppState: ObservableObject {
         } else {
             self.selectedIndex = min(max(0, self.selectedIndex), max(0, self.items.count - 1))
         }
-        setFullScreen(true)
     }
     
     func navigateBack() {
@@ -205,12 +267,13 @@ final class AppState: ObservableObject {
         if let previousState = folderHistory.popLast() {
             parseDirectory(previousState.url, resetIndex: false)
             selectedIndex = min(max(0, previousState.selectedIndex), max(0, items.count - 1))
+            updateWindowForMode(.browser)
         } else {
             currentFolder = nil
             items = []
             folderHistory.removeAll()
             selectedIndex = 0
-            setFullScreen(false)
+            updateWindowForMode(.dropzone)
         }
     }
     
@@ -228,9 +291,9 @@ final class AppState: ObservableObject {
             return
         }
         
+        updateWindowForMode(.slideshow)
         resetVideoState()
         isSlideshowActive = true
-        setFullScreen(true)
         resetTimer()
     }
     
@@ -242,9 +305,7 @@ final class AppState: ObservableObject {
         
         if let folder = currentFolder {
             parseDirectory(folder, resetIndex: false)
-            setFullScreen(true)
-        } else {
-            setFullScreen(false)
+            updateWindowForMode(.browser)
         }
     }
     
@@ -328,11 +389,31 @@ final class AppState: ObservableObject {
         }
     }
     
-    func setFullScreen(_ enable: Bool) {
+    func toggleFullScreen() {
         guard let window = NSApp.keyWindow ?? NSApp.windows.first else { return }
-        let isFull = window.styleMask.contains(.fullScreen)
-        if (enable && !isFull) || (!enable && isFull) {
+        window.toggleFullScreen(nil)
+    }
+    
+    func setFullScreenState(_ fullScreen: Bool) {
+        isFullScreen = fullScreen
+    }
+    
+    private func updateWindowForMode(_ mode: WindowInteractionMode) {
+        guard let window = NSApp.keyWindow ?? NSApp.windows.first else { return }
+        let spec = AppState.spec(for: mode)
+        
+        if mode == .dropzone && window.styleMask.contains(.fullScreen) {
             window.toggleFullScreen(nil)
+        }
+        
+        if spec.isResizable {
+            window.styleMask.insert(.resizable)
+        } else {
+            window.styleMask.remove(.resizable)
+        }
+        
+        if !window.styleMask.contains(.fullScreen) {
+            window.setContentSize(NSSize(width: spec.width, height: spec.height))
         }
     }
 }
@@ -486,7 +567,6 @@ struct PhotoSlideView: View {
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                Color.black
                 if let image = image {
                     Image(nsImage: image)
                         .resizable()
@@ -497,7 +577,6 @@ struct PhotoSlideView: View {
                 }
             }
         }
-        .edgesIgnoringSafeArea(.all)
         .task(id: url) {
             image = ImageLoader.loadFullImage(from: url)
         }
@@ -510,9 +589,19 @@ struct DropzoneView: View {
     
     var body: some View {
         VStack(spacing: 20) {
+            HStack {
+                Spacer()
+                Button(action: { state.isDarkMode.toggle() }) {
+                    Image(systemName: state.isDarkMode ? "sun.max.fill" : "moon.fill")
+                        .font(.title2)
+                }
+                .buttonStyle(.plain)
+                .padding()
+            }
+            Spacer()
             Text("📷").font(.system(size: 80))
-            Text("Drop Media or Folders Here").font(.largeTitle.bold()).foregroundColor(.white)
-            Text("Drag & drop images, videos, or click below").font(.title3).foregroundColor(.gray)
+            Text("Drop Media or Folders Here").font(.largeTitle.bold())
+            Text("Drag & drop images, videos, or click below").font(.title3).foregroundColor(.secondary)
             
             Button("📁 Choose Folder") {
                 let panel = NSOpenPanel()
@@ -525,9 +614,10 @@ struct DropzoneView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
+            Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black)
+        .background(state.isDarkMode ? Color.black : Color(NSColor.windowBackgroundColor))
         .onHover { hovering in
             if hovering { NSCursor.arrow.set() }
         }
@@ -538,26 +628,26 @@ struct DropzoneView: View {
 struct GalleryCardView: View {
     let item: MediaItem
     let isSelected: Bool
+    let isDarkMode: Bool
     let action: () -> Void
     @State private var thumbnail: NSImage?
     @State private var isHovered: Bool = false
     
     var body: some View {
         let activeColor = isHovered ? Color.green : (isSelected ? Color.blue : Color.clear)
-        let bgColor = isHovered ? Color.green.opacity(0.3) : (isSelected ? Color.blue.opacity(0.4) : Color.white.opacity(0.1))
+        let bgColor = isHovered ? Color.green.opacity(0.3) : (isSelected ? Color.blue.opacity(0.4) : (isDarkMode ? Color.white.opacity(0.1) : Color.black.opacity(0.05)))
         
         Group {
             if item.isBackAction {
                 VStack(spacing: 12) {
                     Text("↩️").font(.system(size: 64))
-                    Text("Back").font(.body.bold()).foregroundColor(.white)
+                    Text("Back").font(.body.bold())
                 }
             } else if item.isDirectory {
                 VStack(spacing: 8) {
                     Text("📁").font(.system(size: 64))
                     Text(item.name)
                         .font(.body.bold())
-                        .foregroundColor(.white)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -576,7 +666,6 @@ struct GalleryCardView: View {
                     
                     Text(item.name)
                         .font(.caption.bold())
-                        .foregroundColor(.white)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -629,17 +718,27 @@ struct GalleryView: View {
     
     var body: some View {
         VStack {
-            HStack {
+            HStack(spacing: 12) {
                 Text("📁 \(state.currentFolder?.lastPathComponent ?? "Gallery")")
                     .font(.title.bold())
-                    .foregroundColor(.white)
                 Spacer()
-                Button("✕ Exit to Dropzone") {
-                    state.currentFolder = nil
-                    state.folderHistory.removeAll()
-                    NSCursor.unhide()
-                    state.setFullScreen(false)
+                
+                Button(action: { state.toggleFullScreen() }) {
+                    Image(systemName: state.isFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                 }
+                .buttonStyle(.plain)
+                .help("Toggle Fullscreen")
+                
+                Button(action: { state.isDarkMode.toggle() }) {
+                    Image(systemName: state.isDarkMode ? "sun.max.fill" : "moon.fill")
+                }
+                .buttonStyle(.plain)
+                .help("Toggle Theme")
+                
+                Button("✕ Exit") {
+                    state.navigateBack()
+                }
+                .buttonStyle(.plain)
                 .controlSize(.large)
                 .onHover { hovering in
                     if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
@@ -655,7 +754,7 @@ struct GalleryView: View {
                     ScrollView {
                         LazyVGrid(columns: Array(repeating: GridItem(.fixed(240), spacing: 24), count: cols), spacing: 24) {
                             ForEach(Array(state.items.enumerated()), id: \.element.id) { index, item in
-                                GalleryCardView(item: item, isSelected: index == state.selectedIndex) {
+                                GalleryCardView(item: item, isSelected: index == state.selectedIndex, isDarkMode: state.isDarkMode) {
                                     state.startSlideshow(at: index)
                                 }
                                 .id(index)
@@ -675,7 +774,7 @@ struct GalleryView: View {
                 }
             }
         }
-        .background(Color.black)
+        .background(state.isDarkMode ? Color.black : Color(NSColor.windowBackgroundColor))
         .onAppear { NSCursor.unhide() }
         .onHover { hovering in
             if hovering { NSCursor.arrow.set() }
@@ -716,7 +815,6 @@ struct SlideshowView: View {
                         }
                     )
                     .id(current.url)
-                    .edgesIgnoringSafeArea(.all)
                 } else {
                     PhotoSlideView(url: current.url)
                 }
@@ -728,11 +826,14 @@ struct SlideshowView: View {
                     
                     HStack(spacing: 16) {
                         Button("◄ Back") { state.moveSlideshowSelection(by: -1) }
+                            .buttonStyle(.plain)
                         Button(state.isPaused ? "Play" : "Pause") {
                             state.isPaused.toggle()
                             state.resetTimer()
                         }
+                        .buttonStyle(.plain)
                         Button("Next ►") { state.moveSlideshowSelection(by: 1) }
+                            .buttonStyle(.plain)
                         
                         Divider()
                             .frame(height: 18)
@@ -763,7 +864,7 @@ struct SlideshowView: View {
                                 
                                 Text(formatTime(state.videoDuration))
                                     .font(.caption.monospacedDigit())
-                                    .foregroundColor(.gray)
+                                    .foregroundColor(.white.opacity(0.7))
                             }
                         } else {
                             Stepper("Delay: \(state.delaySeconds)s", value: $state.delaySeconds, in: 1...60)
@@ -774,12 +875,21 @@ struct SlideshowView: View {
                             .frame(height: 18)
                             .background(Color.white.opacity(0.3))
                         
+                        Button(action: { state.toggleFullScreen() }) {
+                            Image(systemName: state.isFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Toggle Fullscreen")
+                        
                         Button("✕ Exit") { state.exitSlideshow() }
+                            .buttonStyle(.plain)
                     }
                     .padding(.horizontal, 20)
                     .padding(.vertical, 12)
                     .background(Color.black.opacity(0.85))
                     .cornerRadius(12)
+                    .environment(\.colorScheme, .dark)
+                    .foregroundColor(.white)
                     .padding(.bottom, 75)
                     .onHover { hovering in
                         if hovering { NSCursor.arrow.set() }
@@ -788,7 +898,9 @@ struct SlideshowView: View {
                 .transition(.opacity)
             }
         }
-        .edgesIgnoringSafeArea(.all)
+        .onTapGesture(count: 2) {
+            state.toggleFullScreen()
+        }
         .onContinuousHover { _ in
             handleMouseActivity()
         }
@@ -861,7 +973,6 @@ struct ContentView: View {
                 DropzoneView(state: state)
             }
         }
-        .edgesIgnoringSafeArea(.all)
         .focusable()
         .focusEffectDisabled()
         .focused($isFocused)
@@ -882,6 +993,11 @@ struct ContentView: View {
             
             if state.isSlideshowActive {
                 NSCursor.unhide()
+            }
+            
+            if press.key.character.lowercased() == "f" {
+                state.toggleFullScreen()
+                return .handled
             }
             
             switch press.key {
@@ -915,7 +1031,7 @@ struct ContentView: View {
                 
             case .upArrow:
                 if state.isSlideshowActive {
-                    state.adjustDelay(by: 1)
+                    state.adjustDelay(by: -1)
                 } else {
                     state.moveGridSelection(vertical: -1)
                 }
@@ -963,16 +1079,22 @@ struct SimpleSlideshowApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(state: state)
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(state.isDarkMode ? .dark : .light)
                 .onAppear {
                     appDelegate.onOpenURL = { url in
                         Task { @MainActor in
                             state.loadDirectory(url)
                         }
                     }
+                    appDelegate.onFullScreenChange = { isFullScreen in
+                        Task { @MainActor in
+                            state.setFullScreenState(isFullScreen)
+                        }
+                    }
                 }
         }
-        .defaultSize(width: 400, height: 300) 
+        .defaultSize(width: 400, height: 400)
+        .windowResizability(.contentSize)
         .windowStyle(.hiddenTitleBar)
     }
 }
