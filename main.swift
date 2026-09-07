@@ -62,8 +62,8 @@ final class PiPManager {
         }
 
         let maxDimension: CGFloat = 450
-        var panelWidth: CGFloat = 450
-        var panelHeight: CGFloat = 300
+        var panelWidth: CGFloat = maxDimension
+        var panelHeight: CGFloat = currentItem.isVideo ? (maxDimension * 9.0 / 16.0) : 300
         
         var naturalSize: CGSize? = nil
         if currentItem.isVideo {
@@ -114,13 +114,17 @@ final class PiPManager {
         
         let maxDimension: CGFloat = 450
         var panelWidth: CGFloat = maxDimension
-        var panelHeight: CGFloat = 300
+        var panelHeight: CGFloat = currentItem.isVideo ? (maxDimension * 9.0 / 16.0) : 300
         
         var naturalSize: CGSize? = nil
         if currentItem.isVideo {
             naturalSize = state.sharedPlayerViewModel.assetNaturalSize
         } else {
             naturalSize = ImageLoader.loadFullImage(from: currentItem.url)?.size
+        }
+        
+        if currentItem.isVideo && naturalSize == nil {
+            return
         }
         
         if let size = naturalSize, size.width > 0, size.height > 0 {
@@ -140,7 +144,9 @@ final class PiPManager {
         frame.size.height = panelHeight
         frame.origin.x += (oldWidth - panelWidth) / 2
         frame.origin.y += (oldHeight - panelHeight) / 2
-        panel.setFrame(frame, display: true, animate: true)
+        
+        // Instant resize without animation
+        panel.setFrame(frame, display: true, animate: false)
     }
 
     @MainActor
@@ -169,11 +175,16 @@ final class PlayerViewModel: ObservableObject {
     
     private var endObserver: NSObjectProtocol?
     private var timeObserverToken: Any?
+    private static var sizeCache: [URL: CGSize] = [:]
     
     var onVideoEnded: (() -> Void)?
     
     func setupPlayer(for url: URL) {
         cleanup()
+        
+        if let cachedSize = Self.sizeCache[url] {
+            self.assetNaturalSize = cachedSize
+        }
         
         let asset = AVURLAsset(url: url)
         let playerItem = AVPlayerItem(asset: asset)
@@ -210,7 +221,9 @@ final class PlayerViewModel: ObservableObject {
                 let transform = try? await track.load(.preferredTransform)
                 if let size = size {
                     let isRotated = (transform?.a == 0 && transform?.b == 1.0) || (transform?.a == 0 && transform?.b == -1.0)
-                    self.assetNaturalSize = isRotated ? CGSize(width: size.height, height: size.width) : size
+                    let finalSize = isRotated ? CGSize(width: size.height, height: size.width) : size
+                    Self.sizeCache[url] = finalSize
+                    self.assetNaturalSize = finalSize
                 }
             }
         }
@@ -255,7 +268,7 @@ struct PiPContainerView: View {
             Color.black
             if let current = state.selectedItem, !current.isDirectory {
                 if current.isVideo {
-                    SharedVideoView(viewModel: state.sharedPlayerViewModel, gravity: .resizeAspectFill)
+                    SharedVideoView(viewModel: state.sharedPlayerViewModel, gravity: .resizeAspect)
                         .id(current.id)
                 } else {
                     PhotoSlideView(url: current.url)
@@ -290,6 +303,12 @@ struct PiPContainerView: View {
                                 } else {
                                     state.sharedPlayerViewModel.player?.play()
                                 }
+                            } else {
+                                if state.isPaused {
+                                    // Pause the slideshow timer
+                                } else {
+                                    state.resetTimer()
+                                }
                             }
                             state.resetTimer()
                             state.triggerControls()
@@ -317,8 +336,15 @@ struct PiPContainerView: View {
         .onAppear {
             startTimer()
         }
-        .onChange(of: state.sharedPlayerViewModel.assetNaturalSize) { _, _ in
-            PiPManager.shared.updatePiPContentSize(for: state)
+        .onChange(of: state.sharedPlayerViewModel.assetNaturalSize) { _, newSize in
+            if newSize != nil {
+                PiPManager.shared.updatePiPContentSize(for: state)
+            }
+        }
+        .onChange(of: state.selectedIndex) { _, _ in
+            if let current = state.selectedItem, !current.isVideo {
+                PiPManager.shared.updatePiPContentSize(for: state)
+            }
         }
     }
 
@@ -509,7 +535,13 @@ final class AppState: ObservableObject {
     @Published var currentFolder: URL?
     @Published var folderHistory: [FolderState] = []
     @Published var items: [MediaItem] = []
-    @Published var selectedIndex: Int = 0
+    @Published var selectedIndex: Int = 0 {
+        didSet {
+            if PiPManager.shared.isPiPActive {
+                PiPManager.shared.updatePiPContentSize(for: self)
+            }
+        }
+    }
     @Published var isSlideshowActive: Bool = false
     @Published var isPaused: Bool = false
     @Published var delaySeconds: Int = 5
@@ -1572,7 +1604,8 @@ struct ContentView: View {
                         
                     case 126: // Up Arrow
                         if state.isSlideshowActive {
-                            if let current = state.selectedItem, current.isVideo {
+                            let current = state.selectedItem
+                            if current?.isVideo == true {
                                 state.adjustVolume(by: 0.1)
                             } else {
                                 state.adjustDelay(by: 1)
@@ -1643,9 +1676,9 @@ struct SimpleSlideshowApp: App {
                 .preferredColorScheme(state.isDarkMode ? .dark : .light)
                 .onAppear {
                     appDelegate.state = state
-                    appDelegate.onFullScreenChange = { isFullScreen in
+                    appDelegate.onFullScreenChange = { isFullScreenIn in
                         Task { @MainActor in
-                            state.setFullScreenState(isFullScreen)
+                            state.setFullScreenState(isFullScreenIn)
                         }
                     }
                 }
