@@ -257,11 +257,10 @@ final class PlayerViewModel: ObservableObject {
     }
 }
 
-// MARK: - PiP Container View wrapper with auto-hiding controls
+// MARK: - PiP Container View wrapper with hover-based controls
 struct PiPContainerView: View {
     @ObservedObject var state: AppState
-    @State private var showControls = true
-    @State private var controlsTimer: Timer?
+    @State private var isHovered = false
 
     var body: some View {
         ZStack {
@@ -276,7 +275,7 @@ struct PiPContainerView: View {
                 }
             }
             
-            if showControls {
+            if isHovered {
                 VStack {
                     HStack {
                         Spacer()
@@ -304,14 +303,9 @@ struct PiPContainerView: View {
                                     state.sharedPlayerViewModel.player?.play()
                                 }
                             } else {
-                                if state.isPaused {
-                                    // Pause the slideshow timer
-                                } else {
-                                    state.resetTimer()
-                                }
+                                // Pause the slideshow timer
                             }
                             state.resetTimer()
-                            state.triggerControls()
                         }) {
                             Image(systemName: state.isPaused ? "play.circle.fill" : "pause.circle.fill")
                                 .font(.system(size: 44))
@@ -327,14 +321,15 @@ struct PiPContainerView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .onContinuousHover { _ in
-            handleActivity()
-        }
-        .onTapGesture {
-            handleActivity()
-        }
-        .onAppear {
-            startTimer()
+        .onContinuousHover { phase in
+            withAnimation(.easeInOut(duration: 0.15)) {
+                switch phase {
+                case .active(_):
+                    isHovered = true
+                case .ended:
+                    isHovered = false
+                }
+            }
         }
         .onChange(of: state.sharedPlayerViewModel.assetNaturalSize) { _, newSize in
             if newSize != nil {
@@ -344,24 +339,6 @@ struct PiPContainerView: View {
         .onChange(of: state.selectedIndex) { _, _ in
             if let current = state.selectedItem, !current.isVideo {
                 PiPManager.shared.updatePiPContentSize(for: state)
-            }
-        }
-    }
-
-    private func handleActivity() {
-        withAnimation {
-            showControls = true
-        }
-        startTimer()
-    }
-
-    private func startTimer() {
-        controlsTimer?.invalidate()
-        controlsTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { _ in
-            Task { @MainActor in
-                withAnimation {
-                    showControls = false
-                }
             }
         }
     }
@@ -1305,7 +1282,7 @@ struct SlideshowView: View {
                                     
                                     Spacer()
                                     
-                                    if let current = state.selectedItem, !current.isVideo {
+                                    if let current = state.selectedItem, !current.isDirectory {
                                         Stepper("Delay: \(state.delaySeconds)s", value: $state.delaySeconds, in: 1...60)
                                             .onChange(of: state.delaySeconds) { state.resetTimer() }
                                     }
