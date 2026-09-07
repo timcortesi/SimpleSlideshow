@@ -145,7 +145,6 @@ final class PiPManager {
         frame.origin.x += (oldWidth - panelWidth) / 2
         frame.origin.y += (oldHeight - panelHeight) / 2
         
-        // Instant resize without animation
         panel.setFrame(frame, display: true, animate: false)
     }
 
@@ -1112,14 +1111,6 @@ struct GalleryView: View {
                 
                 Spacer()
                 
-                if !state.isFullScreen {
-                    Button(action: { PiPManager.shared.togglePiP(for: state) }) {
-                        Image(systemName: "pip.enter")
-                    }
-                    .buttonStyle(.plain)
-                    .help("Toggle Picture-in-Picture (P)")
-                }
-                
                 Button(action: { state.toggleFullScreen() }) {
                     Image(systemName: state.isFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                 }
@@ -1209,7 +1200,7 @@ struct SlideshowView: View {
                     
                     let panelWidth: CGFloat = isVideo
                         ? (isReallyWideVideo ? min(totalWidth * 0.90, 900) : (isWide ? totalWidth * 0.90 : totalWidth - 32))
-                        : (isWide ? min(totalWidth * 0.4, 420) : totalWidth - 32)
+                        : (isWide ? min(totalWidth * 0.9, 500) : totalWidth - 32)
                     
                     let isCompactAudio = totalWidth < 600
                     
@@ -1414,9 +1405,13 @@ struct SlideshowView: View {
     @ViewBuilder
     private var controlButtons: some View {
         Group {
-            Button("◄ Back") { state.moveSlideshowSelection(by: -1) }
-                .buttonStyle(.plain)
-            Button(state.isPaused ? "Play" : "Pause") {
+            Button(action: { state.moveSlideshowSelection(by: -1) }) {
+                Image(systemName: "backward.fill")
+            }
+            .buttonStyle(.plain)
+            .help("Previous Item")
+            
+            Button(action: {
                 state.isPaused.toggle()
                 if let current = state.selectedItem, current.isVideo {
                     if state.isPaused {
@@ -1426,10 +1421,17 @@ struct SlideshowView: View {
                     }
                 }
                 state.resetTimer()
+            }) {
+                Image(systemName: state.isPaused ? "play.fill" : "pause.fill")
             }
             .buttonStyle(.plain)
-            Button("Next ►") { state.moveSlideshowSelection(by: 1) }
-                .buttonStyle(.plain)
+            .help(state.isPaused ? "Play" : "Pause")
+            
+            Button(action: { state.moveSlideshowSelection(by: 1) }) {
+                Image(systemName: "forward.fill")
+            }
+            .buttonStyle(.plain)
+            .help("Next Item")
         }
     }
     
