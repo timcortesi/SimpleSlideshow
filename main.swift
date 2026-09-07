@@ -941,11 +941,11 @@ struct SlideshowView: View {
                 GeometryReader { proxy in
                     let totalWidth = proxy.size.width
                     let isVideo = state.selectedItem?.isVideo ?? false
-                    let isReallyWideVideo = isVideo && totalWidth > 1100
-                    let isWide = totalWidth > 800
+                    let isReallyWideVideo = isVideo && totalWidth > 900
+                    let isWide = totalWidth > 600
                     
                     let panelWidth: CGFloat = isVideo
-                        ? (isReallyWideVideo ? min(totalWidth * 0.75, 1100) : (isWide ? totalWidth * 0.75 : totalWidth - 32))
+                        ? (isReallyWideVideo ? min(totalWidth * 0.90, 900) : (isWide ? totalWidth * 0.90 : totalWidth - 32))
                         : (isWide ? min(totalWidth * 0.4, 420) : totalWidth - 32)
                     
                     let isCompactAudio = totalWidth < 600
@@ -1113,7 +1113,7 @@ struct SlideshowView: View {
                         .cornerRadius(12)
                         .environment(\.colorScheme, .dark)
                         .foregroundColor(.white)
-                        .padding(.bottom, 75)
+                        .padding(.bottom, state.isFullScreen ? 75 : 16)
                         .frame(maxWidth: .infinity, alignment: .center)
                     }
                 }
