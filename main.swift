@@ -19,12 +19,29 @@ enum WindowInteractionMode {
 
 // MARK: - App Delegate & File Open Handling
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    var onOpenURL: ((URL) -> Void)?
+    var state: AppState? {
+        didSet {
+            if let url = pendingURL, let state = state {
+                pendingURL = nil
+                Task { @MainActor in
+                    state.loadDirectory(url)
+                }
+            }
+        }
+    }
+    var pendingURL: URL?
     var onFullScreenChange: ((Bool) -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        
+        let windows = NSApp.windows
+        if windows.count > 1 {
+            for window in windows.dropFirst() {
+                window.close()
+            }
+        }
         
         if let window = NSApp.windows.first {
             window.titleVisibility = .hidden
@@ -41,9 +58,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    func application(_ sender: NSApplication, openFile filename: String) -> Bool {
+        let url = URL(fileURLWithPath: filename)
+        if let state = state {
+            Task { @MainActor in
+                state.loadDirectory(url)
+                if let window = NSApp.windows.first {
+                    window.makeKeyAndOrderFront(nil)
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
+        } else {
+            pendingURL = url
+        }
+        return true
+    }
+
+    @MainActor
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let url = urls.first else { return }
-        onOpenURL?(url)
+        
+        let windows = NSApp.windows
+        if windows.count > 1 {
+            for window in windows.dropFirst() {
+                window.close()
+            }
+        }
+        
+        if let state = state {
+            Task { @MainActor in
+                state.loadDirectory(url)
+                if let window = NSApp.windows.first {
+                    window.makeKeyAndOrderFront(nil)
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
+        } else {
+            pendingURL = url
+        }
     }
     
     func windowDidEnterFullScreen(_ notification: Notification) {
@@ -51,6 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowDidExitFullScreen(_ notification: Notification) {
+        NSCursor.unhide()
         onFullScreenChange?(false)
     }
 }
@@ -62,9 +115,8 @@ struct MediaItem: Identifiable, Hashable {
     let name: String
     let isDirectory: Bool
     let isVideo: Bool
-    let isBackAction: Bool
     
-    var isMedia: Bool { !isDirectory && !isBackAction }
+    var isMedia: Bool { !isDirectory }
 }
 
 final class ThumbnailCache {
@@ -92,7 +144,7 @@ actor ImageLoader {
         
         let ext = item.url.pathExtension.lowercased()
         let validImageExts = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "heic", "tiff"]
-        let validVideoExts = ["mp4", "mkv", "mov", "avi"]
+        let validVideoExts = ["mp4", "m4v", "mkv", "mov", "avi"]
         
         do {
             let representation = try await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
@@ -136,10 +188,16 @@ final class AppState: ObservableObject {
     @Published var isPaused: Bool = false
     @Published var delaySeconds: Int = 5
     @Published var gridColumnsCount: Int = 3
-    @Published var seekTrigger: (direction: Int, count: Int)? = nil
+    @Published var seekTrigger: (direction: Int, count: Int, id: UUID)? = nil
     @Published var showControlsSignal: Bool = false
     @Published var isDarkMode: Bool
-    @Published var isFullScreen: Bool = false
+    @Published var isFullScreen: Bool = false {
+        didSet {
+            if !isFullScreen {
+                NSCursor.unhide()
+            }
+        }
+    }
     
     // Video Progress Tracking
     @Published var videoCurrentTime: Double = 0
@@ -164,7 +222,7 @@ final class AppState: ObservableObject {
     static func spec(for mode: WindowInteractionMode) -> WindowLayoutSpec {
         switch mode {
         case .dropzone:
-            return WindowLayoutSpec(width: 400, height: 400, isResizable: false)
+            return WindowLayoutSpec(width: 400, height: 350, isResizable: false)
         case .browser, .slideshow:
             return WindowLayoutSpec(width: 1120, height: 776, isResizable: true)
         }
@@ -180,7 +238,21 @@ final class AppState: ObservableObject {
     
     func loadDirectory(_ url: URL, pushHistory: Bool = true) {
         NSCursor.unhide()
+        
+        if isSlideshowActive {
+            isSlideshowActive = false
+            timer?.invalidate()
+            resetVideoState()
+        }
+        
         updateWindowForMode(.browser)
+        
+        if let window = NSApp.keyWindow ?? NSApp.windows.first {
+            let contentWidth = window.contentView?.bounds.width ?? 1120
+            let availableWidth = contentWidth - 40
+            let calculatedCols = max(1, Int(availableWidth / 264.0))
+            self.gridColumnsCount = calculatedCols
+        }
         
         var target = url
         var isDir: ObjCBool = false
@@ -234,11 +306,11 @@ final class AppState: ObservableObject {
             let ext = file.pathExtension.lowercased()
             
             if isDirectory {
-                folderItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: true, isVideo: false, isBackAction: false))
+                folderItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: true, isVideo: false))
             } else if validImageExts.contains(ext) {
-                mediaItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: false, isVideo: false, isBackAction: false))
+                mediaItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: false, isVideo: false))
             } else if validVideoExts.contains(ext) {
-                mediaItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: false, isVideo: true, isBackAction: false))
+                mediaItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: false, isVideo: true))
             }
         }
         
@@ -246,11 +318,6 @@ final class AppState: ObservableObject {
         mediaItems.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         
         var combinedItems: [MediaItem] = []
-        if currentFolder != nil || !folderHistory.isEmpty {
-            let backItem = MediaItem(url: target, name: ".. (Back)", isDirectory: false, isVideo: false, isBackAction: true)
-            combinedItems.append(backItem)
-        }
-        
         combinedItems.append(contentsOf: folderItems)
         combinedItems.append(contentsOf: mediaItems)
         
@@ -280,11 +347,6 @@ final class AppState: ObservableObject {
     func startSlideshow(at index: Int? = nil) {
         if let idx = index { self.selectedIndex = idx }
         guard let item = selectedItem else { return }
-        
-        if item.isBackAction {
-            navigateBack()
-            return
-        }
         
         if item.isDirectory {
             loadDirectory(item.url)
@@ -316,16 +378,34 @@ final class AppState: ObservableObject {
         }
         resetVideoState()
         
-        var newIndex = selectedIndex + delta
-        if newIndex >= items.count {
-            newIndex = 0
-        } else if newIndex < 0 {
-            newIndex = items.count - 1
+        var newIndex = selectedIndex
+        let count = items.count
+        
+        // Loop through indices to find the next valid non-directory media item
+        for _ in 0..<count {
+            newIndex = newIndex + delta
+            if newIndex >= count {
+                newIndex = 0
+            } else if newIndex < 0 {
+                newIndex = count - 1
+            }
+            
+            if !items[newIndex].isDirectory {
+                break
+            }
         }
+        
         selectedIndex = newIndex
+        
+        // If we somehow landed on a directory (e.g. all items are folders), exit slideshow
+        if selectedItem?.isDirectory == true {
+            exitSlideshow()
+            return
+        }
+        
         resetTimer()
     }
-    
+
     func moveGridSelection(horizontal: Int = 0, vertical: Int = 0) {
         guard !items.isEmpty else { return }
         triggerControls()
@@ -365,7 +445,7 @@ final class AppState: ObservableObject {
             seekAcceleration = 1
         }
         lastSeekTime = now
-        seekTrigger = (direction: forward ? 1 : -1, count: seekAcceleration)
+        seekTrigger = (direction: forward ? 1 : -1, count: seekAcceleration, id: UUID())
     }
     
     func adjustDelay(by seconds: Int) {
@@ -428,7 +508,7 @@ private extension URL {
 struct NativeVideoView: NSViewRepresentable {
     let url: URL
     let isPaused: Bool
-    @Binding var seekTrigger: (direction: Int, count: Int)?
+    @Binding var seekTrigger: (direction: Int, count: Int, id: UUID)?
     @Binding var currentTime: Double
     @Binding var duration: Double
     @Binding var scrubTargetTime: Double?
@@ -439,6 +519,8 @@ struct NativeVideoView: NSViewRepresentable {
         var onEnd: (() -> Void)?
         var observer: Any?
         var timeObserver: Any?
+        var lastHandledSeekID: UUID?
+        var currentURL: URL?
         
         func cleanup() {
             if let obs = observer {
@@ -483,6 +565,7 @@ struct NativeVideoView: NSViewRepresentable {
         
         context.coordinator.player = player
         context.coordinator.onEnd = onEnd
+        context.coordinator.currentURL = url
         context.coordinator.setupNotification(for: playerItem)
         
         let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
@@ -508,8 +591,9 @@ struct NativeVideoView: NSViewRepresentable {
     func updateNSView(_ nsView: AVPlayerView, context: Context) {
         context.coordinator.onEnd = onEnd
         
-        if (nsView.player?.currentItem?.asset as? AVURLAsset)?.url != url {
+        if context.coordinator.currentURL != url {
             context.coordinator.cleanup()
+            context.coordinator.currentURL = url
             
             let playerItem = AVPlayerItem(url: url)
             let player = AVPlayer(playerItem: playerItem)
@@ -545,7 +629,8 @@ struct NativeVideoView: NSViewRepresentable {
             }
         }
         
-        if let seek = seekTrigger {
+        if let seek = seekTrigger, seek.id != context.coordinator.lastHandledSeekID {
+            context.coordinator.lastHandledSeekID = seek.id
             DispatchQueue.main.async {
                 guard let player = context.coordinator.player else { return }
                 let baseSeek: Double = 2.0
@@ -553,7 +638,6 @@ struct NativeVideoView: NSViewRepresentable {
                 let current = player.currentTime().seconds
                 let targetTime = CMTime(seconds: max(0, current + totalOffset), preferredTimescale: 600)
                 player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero)
-                seekTrigger = nil
             }
         }
     }
@@ -588,7 +672,7 @@ struct DropzoneView: View {
     @ObservedObject var state: AppState
     
     var body: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: 10) {
             HStack {
                 Spacer()
                 Button(action: { state.isDarkMode.toggle() }) {
@@ -598,7 +682,6 @@ struct DropzoneView: View {
                 .buttonStyle(.plain)
                 .padding()
             }
-            Spacer()
             Text("📷").font(.system(size: 80))
             Text("Drop Media or Folders Here").font(.largeTitle.bold())
             Text("Drag & drop images, videos, or click below").font(.title3).foregroundColor(.secondary)
@@ -638,12 +721,7 @@ struct GalleryCardView: View {
         let bgColor = isHovered ? Color.green.opacity(0.3) : (isSelected ? Color.blue.opacity(0.4) : (isDarkMode ? Color.white.opacity(0.1) : Color.black.opacity(0.05)))
         
         Group {
-            if item.isBackAction {
-                VStack(spacing: 12) {
-                    Text("↩️").font(.system(size: 64))
-                    Text("Back").font(.body.bold())
-                }
-            } else if item.isDirectory {
+            if item.isDirectory {
                 VStack(spacing: 8) {
                     Text("📁").font(.system(size: 64))
                     Text(item.name)
@@ -717,10 +795,27 @@ struct GalleryView: View {
     let cardWidth: CGFloat = 264
     
     var body: some View {
-        VStack {
+        VStack(spacing: 0) {
             HStack(spacing: 12) {
+                if !state.folderHistory.isEmpty || state.currentFolder != nil {
+                    Button(action: { state.navigateBack() }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 12, weight: .bold))
+                            Text(state.folderHistory.last?.url.lastPathComponent ?? "Back")
+                                .font(.body.bold())
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+                    .help("Back to previous folder (Esc)")
+                }
+                
                 Text("📁 \(state.currentFolder?.lastPathComponent ?? "Gallery")")
                     .font(.title.bold())
+                
                 Spacer()
                 
                 Button(action: { state.toggleFullScreen() }) {
@@ -733,16 +828,7 @@ struct GalleryView: View {
                     Image(systemName: state.isDarkMode ? "sun.max.fill" : "moon.fill")
                 }
                 .buttonStyle(.plain)
-                .help("Toggle Theme")
-                
-                Button("✕ Exit") {
-                    state.navigateBack()
-                }
-                .buttonStyle(.plain)
-                .controlSize(.large)
-                .onHover { hovering in
-                    if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
-                }
+                .help("Toggle Theme")                
             }
             .padding()
             
@@ -801,7 +887,7 @@ struct SlideshowView: View {
         ZStack {
             Color.black.edgesIgnoringSafeArea(.all)
             
-            if let current = state.selectedItem {
+            if let current = state.selectedItem, !current.isDirectory {
                 if current.isVideo {
                     NativeVideoView(
                         url: current.url,
@@ -814,9 +900,10 @@ struct SlideshowView: View {
                             state.moveSlideshowSelection(by: 1, userInitiated: false)
                         }
                     )
-                    .id(current.url)
+                    .id(current.id)
                 } else {
                     PhotoSlideView(url: current.url)
+                        .id(current.id)
                 }
             }
             
@@ -918,6 +1005,15 @@ struct SlideshowView: View {
         .onChange(of: state.showControlsSignal) { _, _ in
             triggerControls()
         }
+        .onChange(of: state.isFullScreen) { _, isFull in
+            if !isFull {
+                NSCursor.unhide()
+                isCursorHidden = false
+                cursorHideTimer?.invalidate()
+            } else {
+                startCursorHideTimer()
+            }
+        }
     }
     
     private func handleMouseActivity() {
@@ -946,9 +1042,12 @@ struct SlideshowView: View {
     
     private func startCursorHideTimer() {
         cursorHideTimer?.invalidate()
+        
+        guard state.isFullScreen else { return }
+        
         cursorHideTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { _ in
             Task { @MainActor in
-                guard !state.isScrubbing else { return }
+                guard state.isFullScreen, !state.isScrubbing else { return }
                 if !isCursorHidden {
                     NSCursor.hide()
                     isCursorHidden = true
@@ -958,10 +1057,10 @@ struct SlideshowView: View {
     }
 }
 
-// MARK: - Root View & Key Bindings
+// MARK: - Root View & Key Bindings via Window-Level NSEvent Monitor
 struct ContentView: View {
     @ObservedObject var state: AppState
-    @FocusState private var isFocused: Bool
+    @State private var keyMonitor: Any?
     
     var body: some View {
         Group {
@@ -973,12 +1072,6 @@ struct ContentView: View {
                 DropzoneView(state: state)
             }
         }
-        .focusable()
-        .focusEffectDisabled()
-        .focused($isFocused)
-        .onAppear { isFocused = true }
-        .onChange(of: state.isSlideshowActive) { _, _ in isFocused = true }
-        .onChange(of: state.currentFolder) { _, _ in isFocused = true }
         .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
@@ -988,83 +1081,96 @@ struct ContentView: View {
             }
             return true
         }
-        .onKeyPress { press in
-            let isCommandPressed = press.modifiers.contains(EventModifiers.command)
-            
-            if state.isSlideshowActive {
-                NSCursor.unhide()
+        .onAppear {
+            if keyMonitor == nil {
+                keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    guard let currentWindow = NSApp.keyWindow, currentWindow === event.window || NSApp.windows.contains(where: { $0 === event.window }) else {
+                        return event
+                    }
+                    
+                    let isCommandPressed = event.modifierFlags.contains(.command)
+                    
+                    if state.isSlideshowActive {
+                        NSCursor.unhide()
+                    }
+                    
+                    let characters = event.charactersIgnoringModifiers?.lowercased() ?? ""
+                    
+                    if characters == "f" {
+                        state.toggleFullScreen()
+                        return nil
+                    }
+                    
+                    switch event.keyCode {
+                    case 124: // Right Arrow
+                        if isCommandPressed && state.isSlideshowActive, let current = state.selectedItem, current.isVideo {
+                            state.seekVideo(forward: true)
+                        } else if state.isSlideshowActive {
+                            state.moveSlideshowSelection(by: 1)
+                        } else {
+                            state.moveGridSelection(horizontal: 1)
+                        }
+                        return nil
+                        
+                    case 123: // Left Arrow
+                        if isCommandPressed && state.isSlideshowActive, let current = state.selectedItem, current.isVideo {
+                            state.seekVideo(forward: false)
+                        } else if state.isSlideshowActive {
+                            state.moveSlideshowSelection(by: -1)
+                        } else {
+                            state.moveGridSelection(horizontal: -1)
+                        }
+                        return nil
+                        
+                    case 125: // Down Arrow
+                        if state.isSlideshowActive {
+                            state.adjustDelay(by: -1)
+                        } else {
+                            state.moveGridSelection(vertical: 1)
+                        }
+                        return nil
+                        
+                    case 126: // Up Arrow
+                        if state.isSlideshowActive {
+                            state.adjustDelay(by: 1)
+                        } else {
+                            state.moveGridSelection(vertical: -1)
+                        }
+                        return nil
+                        
+                    case 36, 76: // Return /Enter
+                        state.triggerControls()
+                        if !state.isSlideshowActive {
+                            state.startSlideshow()
+                        }
+                        return nil
+                        
+                    case 49: // Spacebar
+                        state.triggerControls()
+                        if state.isSlideshowActive {
+                            state.isPaused.toggle()
+                            state.resetTimer()
+                        }
+                        return nil
+                        
+                    case 53: // Escape
+                        if state.isSlideshowActive {
+                            state.exitSlideshow()
+                        } else if state.currentFolder != nil {
+                            state.navigateBack()
+                        }
+                        return nil
+                        
+                    default:
+                        return event
+                    }
+                }
             }
-            
-            if press.key.character.lowercased() == "f" {
-                state.toggleFullScreen()
-                return .handled
-            }
-            
-            switch press.key {
-            case .rightArrow:
-                if isCommandPressed && state.isSlideshowActive, let current = state.selectedItem, current.isVideo {
-                    state.seekVideo(forward: true)
-                } else if state.isSlideshowActive {
-                    state.moveSlideshowSelection(by: 1)
-                } else {
-                    state.moveGridSelection(horizontal: 1)
-                }
-                return .handled
-                
-            case .leftArrow:
-                if isCommandPressed && state.isSlideshowActive, let current = state.selectedItem, current.isVideo {
-                    state.seekVideo(forward: false)
-                } else if state.isSlideshowActive {
-                    state.moveSlideshowSelection(by: -1)
-                } else {
-                    state.moveGridSelection(horizontal: -1)
-                }
-                return .handled
-                
-            case .downArrow:
-                if state.isSlideshowActive {
-                    state.adjustDelay(by: -1)
-                } else {
-                    state.moveGridSelection(vertical: 1)
-                }
-                return .handled
-                
-            case .upArrow:
-                if state.isSlideshowActive {
-                    state.adjustDelay(by: -1)
-                } else {
-                    state.moveGridSelection(vertical: -1)
-                }
-                return .handled
-                
-            case .return:
-                state.triggerControls()
-                if !state.isSlideshowActive {
-                    state.startSlideshow()
-                }
-                return .handled
-                
-            case .space:
-                state.triggerControls()
-                if state.isSlideshowActive {
-                    state.isPaused.toggle()
-                    state.resetTimer()
-                }
-                return .handled
-                
-            case .escape:
-                if state.isSlideshowActive {
-                    state.exitSlideshow()
-                } else if state.currentFolder != nil {
-                    state.navigateBack()
-                }
-                return .handled
-                
-            case .tab:
-                return .ignored
-                
-            default:
-                return .ignored
+        }
+        .onDisappear {
+            if let monitor = keyMonitor {
+                NSEvent.removeMonitor(monitor)
+                keyMonitor = nil
             }
         }
     }
@@ -1081,11 +1187,7 @@ struct SimpleSlideshowApp: App {
             ContentView(state: state)
                 .preferredColorScheme(state.isDarkMode ? .dark : .light)
                 .onAppear {
-                    appDelegate.onOpenURL = { url in
-                        Task { @MainActor in
-                            state.loadDirectory(url)
-                        }
-                    }
+                    appDelegate.state = state
                     appDelegate.onFullScreenChange = { isFullScreen in
                         Task { @MainActor in
                             state.setFullScreenState(isFullScreen)
@@ -1093,7 +1195,7 @@ struct SimpleSlideshowApp: App {
                     }
                 }
         }
-        .defaultSize(width: 400, height: 400)
+        .defaultSize(width: 400, height: 350)
         .windowResizability(.contentSize)
         .windowStyle(.hiddenTitleBar)
     }
