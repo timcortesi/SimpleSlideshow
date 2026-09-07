@@ -8,6 +8,10 @@ import UniformTypeIdentifiers
 struct WindowLayoutSpec {
     let width: CGFloat
     let height: CGFloat
+    let minWidth: CGFloat
+    let minHeight: CGFloat
+    let maxWidth: CGFloat
+    let maxHeight: CGFloat
     let isResizable: Bool
 }
 
@@ -50,6 +54,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.delegate = self
             let spec = AppState.spec(for: .dropzone)
             window.setContentSize(NSSize(width: spec.width, height: spec.height))
+            window.minSize = NSSize(width: spec.minWidth, height: spec.minHeight)
+            window.maxSize = NSSize(width: spec.maxWidth, height: spec.maxHeight)
             window.styleMask.remove(.resizable)
         }
         
@@ -187,6 +193,7 @@ final class AppState: ObservableObject {
     @Published var isSlideshowActive: Bool = false
     @Published var isPaused: Bool = false
     @Published var delaySeconds: Int = 5
+    @Published var videoVolume: Double = 1.0
     @Published var gridColumnsCount: Int = 3
     @Published var seekTrigger: (direction: Int, count: Int, id: UUID)? = nil
     @Published var showControlsSignal: Bool = false
@@ -222,9 +229,19 @@ final class AppState: ObservableObject {
     static func spec(for mode: WindowInteractionMode) -> WindowLayoutSpec {
         switch mode {
         case .dropzone:
-            return WindowLayoutSpec(width: 400, height: 350, isResizable: false)
+            return WindowLayoutSpec(
+                width: 400, height: 350,
+                minWidth: 400, minHeight: 350,
+                maxWidth: 400, maxHeight: 350,
+                isResizable: false
+            )
         case .browser, .slideshow:
-            return WindowLayoutSpec(width: 1120, height: 776, isResizable: true)
+            return WindowLayoutSpec(
+                width: 1120, height: 776,
+                minWidth: 400, minHeight: 350,
+                maxWidth: CGFloat.greatestFiniteMagnitude, maxHeight: CGFloat.greatestFiniteMagnitude,
+                isResizable: true
+            )
         }
     }
     
@@ -381,7 +398,6 @@ final class AppState: ObservableObject {
         var newIndex = selectedIndex
         let count = items.count
         
-        // Loop through indices to find the next valid non-directory media item
         for _ in 0..<count {
             newIndex = newIndex + delta
             if newIndex >= count {
@@ -397,7 +413,6 @@ final class AppState: ObservableObject {
         
         selectedIndex = newIndex
         
-        // If we somehow landed on a directory (e.g. all items are folders), exit slideshow
         if selectedItem?.isDirectory == true {
             exitSlideshow()
             return
@@ -455,6 +470,12 @@ final class AppState: ObservableObject {
         resetTimer()
     }
     
+    func adjustVolume(by amount: Double) {
+        triggerControls()
+        let newVolume = videoVolume + amount
+        videoVolume = min(max(0.0, newVolume), 1.0)
+    }
+    
     func triggerControls() {
         showControlsSignal.toggle()
     }
@@ -492,6 +513,9 @@ final class AppState: ObservableObject {
             window.styleMask.remove(.resizable)
         }
         
+        window.minSize = NSSize(width: spec.minWidth, height: spec.minHeight)
+        window.maxSize = NSSize(width: spec.maxWidth, height: spec.maxHeight)
+        
         if !window.styleMask.contains(.fullScreen) {
             window.setContentSize(NSSize(width: spec.width, height: spec.height))
         }
@@ -508,6 +532,7 @@ private extension URL {
 struct NativeVideoView: NSViewRepresentable {
     let url: URL
     let isPaused: Bool
+    let volume: Double
     @Binding var seekTrigger: (direction: Int, count: Int, id: UUID)?
     @Binding var currentTime: Double
     @Binding var duration: Double
@@ -560,6 +585,7 @@ struct NativeVideoView: NSViewRepresentable {
         let playerView = AVPlayerView()
         let playerItem = AVPlayerItem(url: url)
         let player = AVPlayer(playerItem: playerItem)
+        player.volume = Float(volume)
         playerView.player = player
         playerView.controlsStyle = .none
         
@@ -590,6 +616,7 @@ struct NativeVideoView: NSViewRepresentable {
     
     func updateNSView(_ nsView: AVPlayerView, context: Context) {
         context.coordinator.onEnd = onEnd
+        nsView.player?.volume = Float(volume)
         
         if context.coordinator.currentURL != url {
             context.coordinator.cleanup()
@@ -597,6 +624,7 @@ struct NativeVideoView: NSViewRepresentable {
             
             let playerItem = AVPlayerItem(url: url)
             let player = AVPlayer(playerItem: playerItem)
+            player.volume = Float(volume)
             nsView.player = player
             context.coordinator.player = player
             context.coordinator.setupNotification(for: playerItem)
@@ -828,7 +856,7 @@ struct GalleryView: View {
                     Image(systemName: state.isDarkMode ? "sun.max.fill" : "moon.fill")
                 }
                 .buttonStyle(.plain)
-                .help("Toggle Theme")                
+                .help("Toggle Theme")
             }
             .padding()
             
@@ -874,6 +902,7 @@ struct SlideshowView: View {
     @State private var controlsTimer: Timer?
     @State private var cursorHideTimer: Timer?
     @State private var isCursorHidden = false
+    @State private var showVolumePopover = false
     
     private func formatTime(_ seconds: Double) -> String {
         guard !seconds.isNaN && seconds.isFinite && seconds >= 0 else { return "00:00" }
@@ -892,6 +921,7 @@ struct SlideshowView: View {
                     NativeVideoView(
                         url: current.url,
                         isPaused: state.isPaused,
+                        volume: state.videoVolume,
                         seekTrigger: $state.seekTrigger,
                         currentTime: $state.videoCurrentTime,
                         duration: $state.videoDuration,
@@ -908,78 +938,183 @@ struct SlideshowView: View {
             }
             
             if showControls {
-                VStack {
-                    Spacer()
+                GeometryReader { proxy in
+                    let totalWidth = proxy.size.width
+                    let isVideo = state.selectedItem?.isVideo ?? false
+                    let isReallyWideVideo = isVideo && totalWidth > 1100
+                    let isWide = totalWidth > 800
                     
-                    HStack(spacing: 16) {
-                        Button("◄ Back") { state.moveSlideshowSelection(by: -1) }
-                            .buttonStyle(.plain)
-                        Button(state.isPaused ? "Play" : "Pause") {
-                            state.isPaused.toggle()
-                            state.resetTimer()
-                        }
-                        .buttonStyle(.plain)
-                        Button("Next ►") { state.moveSlideshowSelection(by: 1) }
-                            .buttonStyle(.plain)
+                    let panelWidth: CGFloat = isVideo
+                        ? (isReallyWideVideo ? min(totalWidth * 0.75, 1100) : (isWide ? totalWidth * 0.75 : totalWidth - 32))
+                        : (isWide ? min(totalWidth * 0.4, 420) : totalWidth - 32)
+                    
+                    let isCompactAudio = totalWidth < 600
+                    
+                    VStack {
+                        Spacer()
                         
-                        Divider()
-                            .frame(height: 18)
-                            .background(Color.white.opacity(0.3))
-                        
-                        if let current = state.selectedItem, current.isVideo {
-                            HStack(spacing: 8) {
-                                Text(formatTime(state.videoCurrentTime))
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundColor(.white)
-                                
-                                Slider(
-                                    value: Binding(
-                                        get: { min(max(0, state.videoCurrentTime), state.videoDuration) },
-                                        set: { newValue in
-                                            state.videoCurrentTime = newValue
-                                            state.scrubTargetTime = newValue
+                        VStack(spacing: 12) {
+                            if isReallyWideVideo {
+                                // Single row layout for video on very wide screens
+                                HStack(spacing: 16) {
+                                    controlButtons
+                                    
+                                    Divider()
+                                        .frame(height: 20)
+                                        .background(Color.white.opacity(0.2))
+                                    
+                                    Text(formatTime(state.videoCurrentTime))
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundColor(.white)
+                                    
+                                    // Timeline takes up the majority of the width
+                                    Slider(
+                                        value: Binding(
+                                            get: { min(max(0, state.videoCurrentTime), state.videoDuration) },
+                                            set: { newValue in
+                                                state.videoCurrentTime = newValue
+                                                state.scrubTargetTime = newValue
+                                            }
+                                        ),
+                                        in: 0...max(1.0, state.videoDuration),
+                                        onEditingChanged: { editing in
+                                            state.isScrubbing = editing
+                                            triggerControls()
                                         }
-                                    ),
-                                    in: 0...max(1.0, state.videoDuration),
-                                    onEditingChanged: { editing in
-                                        state.isScrubbing = editing
-                                        triggerControls()
+                                    )
+                                    .accentColor(.blue)
+                                    .frame(maxWidth: .infinity)
+                                    
+                                    Text(formatTime(state.videoDuration))
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundColor(.white.opacity(0.7))
+                                    
+                                    Divider()
+                                        .frame(height: 20)
+                                        .background(Color.white.opacity(0.2))
+                                    
+                                    // Compact audio slider section with fixed width
+                                    HStack(spacing: 6) {
+                                        Image(systemName: state.videoVolume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                                            .foregroundColor(.white.opacity(0.8))
+                                            .font(.caption)
+                                        Slider(
+                                            value: $state.videoVolume,
+                                            in: 0...1.0,
+                                            onEditingChanged: { _ in
+                                                triggerControls()
+                                            }
+                                        )
+                                        .accentColor(.blue)
+                                        .frame(width: 80)
                                     }
-                                )
-                                .accentColor(.blue)
-                                .frame(width: 200)
+                                    
+                                    Divider()
+                                        .frame(height: 20)
+                                        .background(Color.white.opacity(0.2))
+                                    
+                                    utilityButtons
+                                }
+                            } else {
+                                // Two-row layout for image slideshows or standard/smaller video windows
+                                HStack(spacing: 16) {
+                                    controlButtons
+                                    
+                                    Spacer()
+                                    
+                                    if let current = state.selectedItem, !current.isVideo {
+                                        Stepper("Delay: \(state.delaySeconds)s", value: $state.delaySeconds, in: 1...60)
+                                            .onChange(of: state.delaySeconds) { state.resetTimer() }
+                                    }
+                                    
+                                    utilityButtons
+                                }
                                 
-                                Text(formatTime(state.videoDuration))
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundColor(.white.opacity(0.7))
+                                // Row 2: Timeline & Audio Controls
+                                if let current = state.selectedItem, current.isVideo {
+                                    Divider()
+                                        .background(Color.white.opacity(0.2))
+                                    
+                                    HStack(spacing: 12) {
+                                        Text(formatTime(state.videoCurrentTime))
+                                            .font(.caption.monospacedDigit())
+                                            .foregroundColor(.white)
+                                        
+                                        Slider(
+                                            value: Binding(
+                                                get: { min(max(0, state.videoCurrentTime), state.videoDuration) },
+                                                set: { newValue in
+                                                    state.videoCurrentTime = newValue
+                                                    state.scrubTargetTime = newValue
+                                                }
+                                            ),
+                                            in: 0...max(1.0, state.videoDuration),
+                                            onEditingChanged: { editing in
+                                                state.isScrubbing = editing
+                                                triggerControls()
+                                            }
+                                        )
+                                        .accentColor(.blue)
+                                        .frame(maxWidth: .infinity)
+                                        
+                                        Text(formatTime(state.videoDuration))
+                                            .font(.caption.monospacedDigit())
+                                            .foregroundColor(.white.opacity(0.7))
+                                        
+                                        if isCompactAudio {
+                                            Button(action: { showVolumePopover.toggle() }) {
+                                                Image(systemName: state.videoVolume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                                                    .foregroundColor(.white.opacity(0.8))
+                                                    .font(.body)
+                                            }
+                                            .buttonStyle(.plain)
+                                            .help("Volume Settings")
+                                            .popover(isPresented: $showVolumePopover, arrowEdge: .top) {
+                                                VStack(spacing: 8) {
+                                                    Text("Volume: \(Int(state.videoVolume * 100))%")
+                                                        .font(.caption.bold())
+                                                    Slider(
+                                                        value: $state.videoVolume,
+                                                        in: 0...1.0,
+                                                        onEditingChanged: { _ in
+                                                            triggerControls()
+                                                        }
+                                                    )
+                                                    .accentColor(.blue)
+                                                    .frame(width: 140)
+                                                }
+                                                .padding(12)
+                                                .background(Color.black.opacity(0.9))
+                                            }
+                                        } else {
+                                            HStack(spacing: 6) {
+                                                Image(systemName: state.videoVolume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                                                    .foregroundColor(.white.opacity(0.8))
+                                                    .font(.caption)
+                                                Slider(
+                                                    value: $state.videoVolume,
+                                                    in: 0...1.0,
+                                                    onEditingChanged: { _ in
+                                                        triggerControls()
+                                                    }
+                                                )
+                                                .accentColor(.blue)
+                                                .frame(width: 90)
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        } else {
-                            Stepper("Delay: \(state.delaySeconds)s", value: $state.delaySeconds, in: 1...60)
-                                .onChange(of: state.delaySeconds) { state.resetTimer() }
                         }
-                        
-                        Divider()
-                            .frame(height: 18)
-                            .background(Color.white.opacity(0.3))
-                        
-                        Button(action: { state.toggleFullScreen() }) {
-                            Image(systemName: state.isFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                        }
-                        .buttonStyle(.plain)
-                        .help("Toggle Fullscreen")
-                        
-                        Button("✕ Exit") { state.exitSlideshow() }
-                            .buttonStyle(.plain)
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 12)
-                    .background(Color.black.opacity(0.85))
-                    .cornerRadius(12)
-                    .environment(\.colorScheme, .dark)
-                    .foregroundColor(.white)
-                    .padding(.bottom, 75)
-                    .onHover { hovering in
-                        if hovering { NSCursor.arrow.set() }
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 14)
+                        .frame(width: panelWidth)
+                        .background(Color.black.opacity(0.85))
+                        .cornerRadius(12)
+                        .environment(\.colorScheme, .dark)
+                        .foregroundColor(.white)
+                        .padding(.bottom, 75)
+                        .frame(maxWidth: .infinity, alignment: .center)
                     }
                 }
                 .transition(.opacity)
@@ -1016,6 +1151,35 @@ struct SlideshowView: View {
         }
     }
     
+    @ViewBuilder
+    private var controlButtons: some View {
+        Group {
+            Button("◄ Back") { state.moveSlideshowSelection(by: -1) }
+                .buttonStyle(.plain)
+            Button(state.isPaused ? "Play" : "Pause") {
+                state.isPaused.toggle()
+                state.resetTimer()
+            }
+            .buttonStyle(.plain)
+            Button("Next ►") { state.moveSlideshowSelection(by: 1) }
+                .buttonStyle(.plain)
+        }
+    }
+    
+    @ViewBuilder
+    private var utilityButtons: some View {
+        Group {
+            Button(action: { state.toggleFullScreen() }) {
+                Image(systemName: state.isFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+            }
+            .buttonStyle(.plain)
+            .help("Toggle Fullscreen")
+            
+            Button("✕ Exit") { state.exitSlideshow() }
+                .buttonStyle(.plain)
+        }
+    }
+    
     private func handleMouseActivity() {
         if isCursorHidden {
             NSCursor.unhide()
@@ -1031,7 +1195,7 @@ struct SlideshowView: View {
         withAnimation { showControls = true }
         controlsTimer?.invalidate()
         
-        guard !state.isScrubbing else { return }
+        guard !state.isScrubbing && !showVolumePopover else { return }
         
         controlsTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { _ in
             Task { @MainActor in
@@ -1047,7 +1211,7 @@ struct SlideshowView: View {
         
         cursorHideTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { _ in
             Task { @MainActor in
-                guard state.isFullScreen, !state.isScrubbing else { return }
+                guard state.isFullScreen, !state.isScrubbing, !showVolumePopover else { return }
                 if !isCursorHidden {
                     NSCursor.hide()
                     isCursorHidden = true
@@ -1124,7 +1288,11 @@ struct ContentView: View {
                         
                     case 125: // Down Arrow
                         if state.isSlideshowActive {
-                            state.adjustDelay(by: -1)
+                            if let current = state.selectedItem, current.isVideo {
+                                state.adjustVolume(by: -0.1)
+                            } else {
+                                state.adjustDelay(by: -1)
+                            }
                         } else {
                             state.moveGridSelection(vertical: 1)
                         }
@@ -1132,7 +1300,11 @@ struct ContentView: View {
                         
                     case 126: // Up Arrow
                         if state.isSlideshowActive {
-                            state.adjustDelay(by: 1)
+                            if let current = state.selectedItem, current.isVideo {
+                                state.adjustVolume(by: 0.1)
+                            } else {
+                                state.adjustDelay(by: 1)
+                            }
                         } else {
                             state.moveGridSelection(vertical: -1)
                         }
