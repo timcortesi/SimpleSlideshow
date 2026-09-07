@@ -3,6 +3,7 @@ import AVKit
 import QuickLookThumbnailing
 import AppKit
 import UniformTypeIdentifiers
+import Combine
 
 // MARK: - Window Layout Configuration Model
 struct WindowLayoutSpec {
@@ -19,6 +20,325 @@ enum WindowInteractionMode {
     case dropzone
     case browser
     case slideshow
+}
+
+// MARK: - Picture-in-Picture Floating Panel Manager
+final class PiPPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
+final class PiPManager {
+    static let shared = PiPManager()
+    private var pipWindow: PiPPanel?
+    private var isTransitioning = false
+
+    var isPiPActive: Bool {
+        return pipWindow != nil
+    }
+
+    @MainActor
+    func togglePiP(for state: AppState) {
+        if state.isFullScreen || isTransitioning { return }
+        
+        if pipWindow != nil {
+            closePiP()
+        } else {
+            openPiP(for: state)
+        }
+    }
+
+    @MainActor
+    func openPiP(for state: AppState) {
+        guard !state.isFullScreen && !isTransitioning else { return }
+        guard let currentItem = state.selectedItem, !currentItem.isDirectory else { return }
+        
+        isTransitioning = true
+        closePiP(animated: false)
+
+        if currentItem.isVideo && state.sharedPlayerViewModel.player == nil {
+            state.sharedPlayerViewModel.setupPlayer(for: currentItem.url)
+            state.sharedPlayerViewModel.player?.volume = Float(state.videoVolume)
+        }
+
+        let maxDimension: CGFloat = 450
+        var panelWidth: CGFloat = 450
+        var panelHeight: CGFloat = 300
+        
+        var naturalSize: CGSize? = nil
+        if currentItem.isVideo {
+            naturalSize = state.sharedPlayerViewModel.assetNaturalSize
+        } else {
+            naturalSize = ImageLoader.loadFullImage(from: currentItem.url)?.size
+        }
+        
+        if let size = naturalSize, size.width > 0, size.height > 0 {
+            if size.width >= size.height {
+                panelWidth = maxDimension
+                panelHeight = maxDimension * (size.height / size.width)
+            } else {
+                panelHeight = maxDimension
+                panelWidth = maxDimension * (size.width / size.height)
+            }
+        }
+
+        let panel = PiPPanel(
+            contentRect: NSRect(x: 100, y: 100, width: panelWidth, height: panelHeight),
+            styleMask: [.borderless, .utilityWindow, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.isMovableByWindowBackground = true
+        panel.hidesOnDeactivate = false
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        
+        let pipView = PiPContainerView(state: state)
+        panel.contentView = NSHostingView(rootView: pipView)
+        
+        panel.orderFrontRegardless()
+        panel.makeKey()
+        self.pipWindow = panel
+
+        if let mainWindow = NSApp.windows.first(where: { !$0.isKind(of: PiPPanel.self) }) {
+            mainWindow.orderOut(nil)
+        }
+        
+        isTransitioning = false
+    }
+
+    @MainActor
+    func updatePiPContentSize(for state: AppState) {
+        guard let panel = pipWindow, let currentItem = state.selectedItem, !currentItem.isDirectory else { return }
+        
+        let maxDimension: CGFloat = 450
+        var panelWidth: CGFloat = maxDimension
+        var panelHeight: CGFloat = 300
+        
+        var naturalSize: CGSize? = nil
+        if currentItem.isVideo {
+            naturalSize = state.sharedPlayerViewModel.assetNaturalSize
+        } else {
+            naturalSize = ImageLoader.loadFullImage(from: currentItem.url)?.size
+        }
+        
+        if let size = naturalSize, size.width > 0, size.height > 0 {
+            if size.width >= size.height {
+                panelWidth = maxDimension
+                panelHeight = maxDimension * (size.height / size.width)
+            } else {
+                panelHeight = maxDimension
+                panelWidth = maxDimension * (size.width / size.height)
+            }
+        }
+        
+        var frame = panel.frame
+        let oldHeight = frame.height
+        let oldWidth = frame.width
+        frame.size.width = panelWidth
+        frame.size.height = panelHeight
+        frame.origin.x += (oldWidth - panelWidth) / 2
+        frame.origin.y += (oldHeight - panelHeight) / 2
+        panel.setFrame(frame, display: true, animate: true)
+    }
+
+    @MainActor
+    func closePiP(animated: Bool = true) {
+        if let window = pipWindow {
+            window.orderOut(nil)
+            pipWindow = nil
+        }
+        
+        if let mainWindow = NSApp.windows.first(where: { !$0.isKind(of: PiPPanel.self) }), !mainWindow.isVisible {
+            mainWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        
+        isTransitioning = false
+    }
+}
+
+// MARK: - Shared Video Player Model
+@MainActor
+final class PlayerViewModel: ObservableObject {
+    @Published var player: AVPlayer?
+    @Published var assetNaturalSize: CGSize? = nil
+    @Published var currentTime: Double = 0
+    @Published var duration: Double = 1
+    
+    private var endObserver: NSObjectProtocol?
+    private var timeObserverToken: Any?
+    
+    var onVideoEnded: (() -> Void)?
+    
+    func setupPlayer(for url: URL) {
+        cleanup()
+        
+        let asset = AVURLAsset(url: url)
+        let playerItem = AVPlayerItem(asset: asset)
+        
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: playerItem,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                self.removeEndObserver()
+                self.onVideoEnded?()
+            }
+        }
+        
+        let newPlayer = AVPlayer(playerItem: playerItem)
+        player = newPlayer
+        
+        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
+        timeObserverToken = newPlayer.addPeriodicTimeObserver(forInterval: interval, queue: nil) { [weak self] time in
+            MainActor.assumeIsolated {
+                guard let self = self, self.player === newPlayer else { return }
+                self.currentTime = time.seconds
+                if let dur = newPlayer.currentItem?.duration.seconds, !dur.isNaN, dur > 0 {
+                    self.duration = dur
+                }
+            }
+        }
+        
+        Task {
+            if let track = try? await asset.loadTracks(withMediaType: .video).first {
+                let size = try? await track.load(.naturalSize)
+                let transform = try? await track.load(.preferredTransform)
+                if let size = size {
+                    let isRotated = (transform?.a == 0 && transform?.b == 1.0) || (transform?.a == 0 && transform?.b == -1.0)
+                    self.assetNaturalSize = isRotated ? CGSize(width: size.height, height: size.width) : size
+                }
+            }
+        }
+        
+        newPlayer.play()
+    }
+    
+    func removeTimeObserver() {
+        if let token = timeObserverToken, let player = player {
+            player.removeTimeObserver(token)
+            timeObserverToken = nil
+        }
+    }
+    
+    private func removeEndObserver() {
+        if let observer = endObserver {
+            NotificationCenter.default.removeObserver(observer)
+            endObserver = nil
+        }
+    }
+    
+    func cleanup() {
+        removeTimeObserver()
+        removeEndObserver()
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        player = nil
+        assetNaturalSize = nil
+        currentTime = 0
+        duration = 1
+    }
+}
+
+// MARK: - PiP Container View wrapper with auto-hiding controls
+struct PiPContainerView: View {
+    @ObservedObject var state: AppState
+    @State private var showControls = true
+    @State private var controlsTimer: Timer?
+
+    var body: some View {
+        ZStack {
+            Color.black
+            if let current = state.selectedItem, !current.isDirectory {
+                if current.isVideo {
+                    SharedVideoView(viewModel: state.sharedPlayerViewModel, gravity: .resizeAspectFill)
+                        .id(current.id)
+                } else {
+                    PhotoSlideView(url: current.url)
+                        .id(current.id)
+                }
+            }
+            
+            if showControls {
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button(action: {
+                            PiPManager.shared.closePiP()
+                        }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.title2)
+                                .foregroundColor(.white.opacity(0.8))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(10)
+                        .help("Exit Picture-in-Picture")
+                    }
+                    
+                    Spacer()
+                    
+                    if let current = state.selectedItem, !current.isDirectory {
+                        Button(action: {
+                            state.isPaused.toggle()
+                            if current.isVideo {
+                                if state.isPaused {
+                                    state.sharedPlayerViewModel.player?.pause()
+                                } else {
+                                    state.sharedPlayerViewModel.player?.play()
+                                }
+                            }
+                            state.resetTimer()
+                            state.triggerControls()
+                        }) {
+                            Image(systemName: state.isPaused ? "play.circle.fill" : "pause.circle.fill")
+                                .font(.system(size: 44))
+                                .foregroundColor(.white.opacity(0.9))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.bottom, 20)
+                    }
+                }
+                .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .onContinuousHover { _ in
+            handleActivity()
+        }
+        .onTapGesture {
+            handleActivity()
+        }
+        .onAppear {
+            startTimer()
+        }
+        .onChange(of: state.sharedPlayerViewModel.assetNaturalSize) { _, _ in
+            PiPManager.shared.updatePiPContentSize(for: state)
+        }
+    }
+
+    private func handleActivity() {
+        withAnimation {
+            showControls = true
+        }
+        startTimer()
+    }
+
+    private func startTimer() {
+        controlsTimer?.invalidate()
+        controlsTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { _ in
+            Task { @MainActor in
+                withAnimation {
+                    showControls = false
+                }
+            }
+        }
+    }
 }
 
 // MARK: - App Delegate & File Open Handling
@@ -193,7 +513,11 @@ final class AppState: ObservableObject {
     @Published var isSlideshowActive: Bool = false
     @Published var isPaused: Bool = false
     @Published var delaySeconds: Int = 5
-    @Published var videoVolume: Double = 1.0
+    @Published var videoVolume: Double = 1.0 {
+        didSet {
+            sharedPlayerViewModel.player?.volume = Float(videoVolume)
+        }
+    }
     @Published var gridColumnsCount: Int = 3
     @Published var seekTrigger: (direction: Int, count: Int, id: UUID)? = nil
     @Published var showControlsSignal: Bool = false
@@ -202,23 +526,57 @@ final class AppState: ObservableObject {
         didSet {
             if !isFullScreen {
                 NSCursor.unhide()
+            } else {
+                PiPManager.shared.closePiP()
             }
         }
     }
     
-    // Video Progress Tracking
-    @Published var videoCurrentTime: Double = 0
-    @Published var videoDuration: Double = 1
+    @Published var sharedPlayerViewModel = PlayerViewModel()
+    
+    var videoCurrentTime: Double {
+        get { sharedPlayerViewModel.currentTime }
+        set { sharedPlayerViewModel.currentTime = newValue }
+    }
+    
+    var videoDuration: Double {
+        get { sharedPlayerViewModel.duration }
+        set { sharedPlayerViewModel.duration = newValue }
+    }
+    
     @Published var isScrubbing: Bool = false
     @Published var scrubTargetTime: Double? = nil
     
     private var timer: Timer?
     private var lastSeekTime: Date = Date()
     private var seekAcceleration: Int = 1
+    private var cancellables = Set<AnyCancellable>()
     
     init() {
         let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         self.isDarkMode = isDark
+        
+        sharedPlayerViewModel.$currentTime
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+            
+        sharedPlayerViewModel.$duration
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+        
+        sharedPlayerViewModel.onVideoEnded = { [weak self] in
+            guard let self = self else { return }
+            self.isPaused = false
+            self.moveSlideshowSelection(by: 1, userInitiated: false)
+            
+            if PiPManager.shared.isPiPActive {
+                PiPManager.shared.updatePiPContentSize(for: self)
+            }
+        }
     }
     
     var selectedItem: MediaItem? {
@@ -251,10 +609,12 @@ final class AppState: ObservableObject {
         isScrubbing = false
         scrubTargetTime = nil
         seekTrigger = nil
+        sharedPlayerViewModel.cleanup()
     }
     
     func loadDirectory(_ url: URL, pushHistory: Bool = true) {
         NSCursor.unhide()
+        PiPManager.shared.closePiP()
         
         if isSlideshowActive {
             isSlideshowActive = false
@@ -348,6 +708,7 @@ final class AppState: ObservableObject {
     
     func navigateBack() {
         NSCursor.unhide()
+        PiPManager.shared.closePiP()
         if let previousState = folderHistory.popLast() {
             parseDirectory(previousState.url, resetIndex: false)
             selectedIndex = min(max(0, previousState.selectedIndex), max(0, items.count - 1))
@@ -373,6 +734,12 @@ final class AppState: ObservableObject {
         updateWindowForMode(.slideshow)
         resetVideoState()
         isSlideshowActive = true
+        
+        if item.isVideo {
+            sharedPlayerViewModel.setupPlayer(for: item.url)
+            sharedPlayerViewModel.player?.volume = Float(videoVolume)
+        }
+        
         resetTimer()
     }
     
@@ -381,6 +748,7 @@ final class AppState: ObservableObject {
         timer?.invalidate()
         resetVideoState()
         NSCursor.unhide()
+        PiPManager.shared.closePiP()
         
         if let folder = currentFolder {
             parseDirectory(folder, resetIndex: false)
@@ -416,6 +784,11 @@ final class AppState: ObservableObject {
         if selectedItem?.isDirectory == true {
             exitSlideshow()
             return
+        }
+        
+        if let current = selectedItem, current.isVideo {
+            sharedPlayerViewModel.setupPlayer(for: current.url)
+            sharedPlayerViewModel.player?.volume = Float(videoVolume)
         }
         
         resetTimer()
@@ -460,7 +833,13 @@ final class AppState: ObservableObject {
             seekAcceleration = 1
         }
         lastSeekTime = now
-        seekTrigger = (direction: forward ? 1 : -1, count: seekAcceleration, id: UUID())
+        
+        guard let player = sharedPlayerViewModel.player else { return }
+        let baseSeek: Double = 2.0
+        let totalOffset = (forward ? 1.0 : -1.0) * baseSeek * Double(seekAcceleration)
+        let current = player.currentTime().seconds
+        let targetTime = CMTime(seconds: max(0, current + totalOffset), preferredTimescale: 600)
+        player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero)
     }
     
     func adjustDelay(by seconds: Int) {
@@ -528,146 +907,24 @@ private extension URL {
     }
 }
 
-// MARK: - Safe Native Video Player View
-struct NativeVideoView: NSViewRepresentable {
-    let url: URL
-    let isPaused: Bool
-    let volume: Double
-    @Binding var seekTrigger: (direction: Int, count: Int, id: UUID)?
-    @Binding var currentTime: Double
-    @Binding var duration: Double
-    @Binding var scrubTargetTime: Double?
-    let onEnd: () -> Void
-    
-    class Coordinator: NSObject {
-        var player: AVPlayer?
-        var onEnd: (() -> Void)?
-        var observer: Any?
-        var timeObserver: Any?
-        var lastHandledSeekID: UUID?
-        var currentURL: URL?
-        
-        func cleanup() {
-            if let obs = observer {
-                NotificationCenter.default.removeObserver(obs)
-                observer = nil
-            }
-            if let timeObs = timeObserver, let p = player {
-                p.removeTimeObserver(timeObs)
-                timeObserver = nil
-            }
-            player?.pause()
-            player?.replaceCurrentItem(with: nil)
-            player = nil
-        }
-        
-        func setupNotification(for playerItem: AVPlayerItem) {
-            if let obs = observer {
-                NotificationCenter.default.removeObserver(obs)
-            }
-            observer = NotificationCenter.default.addObserver(
-                forName: .AVPlayerItemDidPlayToEndTime,
-                object: playerItem,
-                queue: .main
-            ) { [weak self] _ in
-                self?.onEnd?()
-            }
-        }
-        
-        deinit {
-            cleanup()
-        }
-    }
-    
-    func makeCoordinator() -> Coordinator { Coordinator() }
+// MARK: - Shared Native Video Player View
+struct SharedVideoView: NSViewRepresentable {
+    @ObservedObject var viewModel: PlayerViewModel
+    var gravity: AVLayerVideoGravity = .resizeAspect
     
     func makeNSView(context: Context) -> AVPlayerView {
         let playerView = AVPlayerView()
-        let playerItem = AVPlayerItem(url: url)
-        let player = AVPlayer(playerItem: playerItem)
-        player.volume = Float(volume)
-        playerView.player = player
         playerView.controlsStyle = .none
-        
-        context.coordinator.player = player
-        context.coordinator.onEnd = onEnd
-        context.coordinator.currentURL = url
-        context.coordinator.setupNotification(for: playerItem)
-        
-        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
-        context.coordinator.timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak coordinator = context.coordinator] time in
-            guard coordinator?.player != nil else { return }
-            DispatchQueue.main.async {
-                self.currentTime = time.seconds
-                if let dur = player.currentItem?.duration.seconds, !dur.isNaN, dur > 0 {
-                    self.duration = dur
-                }
-            }
-        }
-        
-        player.play()
+        playerView.player = viewModel.player
+        playerView.videoGravity = gravity
         return playerView
     }
     
-    static func dismantleNSView(_ nsView: AVPlayerView, coordinator: Coordinator) {
-        coordinator.cleanup()
-        nsView.player = nil
-    }
-    
     func updateNSView(_ nsView: AVPlayerView, context: Context) {
-        context.coordinator.onEnd = onEnd
-        nsView.player?.volume = Float(volume)
-        
-        if context.coordinator.currentURL != url {
-            context.coordinator.cleanup()
-            context.coordinator.currentURL = url
-            
-            let playerItem = AVPlayerItem(url: url)
-            let player = AVPlayer(playerItem: playerItem)
-            player.volume = Float(volume)
-            nsView.player = player
-            context.coordinator.player = player
-            context.coordinator.setupNotification(for: playerItem)
-            
-            let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
-            context.coordinator.timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak coordinator = context.coordinator] time in
-                guard coordinator?.player != nil else { return }
-                DispatchQueue.main.async {
-                    self.currentTime = time.seconds
-                    if let dur = player.currentItem?.duration.seconds, !dur.isNaN, dur > 0 {
-                        self.duration = dur
-                    }
-                }
-            }
-            player.play()
+        if nsView.player !== viewModel.player {
+            nsView.player = viewModel.player
         }
-        
-        if isPaused {
-            nsView.player?.pause()
-        } else {
-            nsView.player?.play()
-        }
-        
-        if let scrubTime = scrubTargetTime {
-            DispatchQueue.main.async {
-                guard let player = context.coordinator.player else { return }
-                let target = CMTime(seconds: scrubTime, preferredTimescale: 600)
-                player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
-                self.scrubTargetTime = nil
-            }
-        }
-        
-        if let seek = seekTrigger, seek.id != context.coordinator.lastHandledSeekID {
-            context.coordinator.lastHandledSeekID = seek.id
-            DispatchQueue.main.async {
-                guard let player = context.coordinator.player else { return }
-                let baseSeek: Double = 2.0
-                let totalOffset = Double(seek.direction) * baseSeek * Double(seek.count)
-                let current = player.currentTime().seconds
-                let targetTime = CMTime(seconds: max(0, current + totalOffset), preferredTimescale: 600)
-                player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero)
-            }
-        }
+        nsView.videoGravity = gravity
     }
 }
 
@@ -846,6 +1103,14 @@ struct GalleryView: View {
                 
                 Spacer()
                 
+                if !state.isFullScreen {
+                    Button(action: { PiPManager.shared.togglePiP(for: state) }) {
+                        Image(systemName: "pip.enter")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Toggle Picture-in-Picture (P)")
+                }
+                
                 Button(action: { state.toggleFullScreen() }) {
                     Image(systemName: state.isFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                 }
@@ -918,19 +1183,8 @@ struct SlideshowView: View {
             
             if let current = state.selectedItem, !current.isDirectory {
                 if current.isVideo {
-                    NativeVideoView(
-                        url: current.url,
-                        isPaused: state.isPaused,
-                        volume: state.videoVolume,
-                        seekTrigger: $state.seekTrigger,
-                        currentTime: $state.videoCurrentTime,
-                        duration: $state.videoDuration,
-                        scrubTargetTime: $state.scrubTargetTime,
-                        onEnd: {
-                            state.moveSlideshowSelection(by: 1, userInitiated: false)
-                        }
-                    )
-                    .id(current.id)
+                    SharedVideoView(viewModel: state.sharedPlayerViewModel, gravity: .resizeAspect)
+                        .id(current.id)
                 } else {
                     PhotoSlideView(url: current.url)
                         .id(current.id)
@@ -955,7 +1209,6 @@ struct SlideshowView: View {
                         
                         VStack(spacing: 12) {
                             if isReallyWideVideo {
-                                // Single row layout for video on very wide screens
                                 HStack(spacing: 16) {
                                     controlButtons
                                     
@@ -967,13 +1220,13 @@ struct SlideshowView: View {
                                         .font(.caption.monospacedDigit())
                                         .foregroundColor(.white)
                                     
-                                    // Timeline takes up the majority of the width
                                     Slider(
                                         value: Binding(
                                             get: { min(max(0, state.videoCurrentTime), state.videoDuration) },
                                             set: { newValue in
                                                 state.videoCurrentTime = newValue
-                                                state.scrubTargetTime = newValue
+                                                let target = CMTime(seconds: newValue, preferredTimescale: 600)
+                                                state.sharedPlayerViewModel.player?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
                                             }
                                         ),
                                         in: 0...max(1.0, state.videoDuration),
@@ -993,7 +1246,6 @@ struct SlideshowView: View {
                                         .frame(height: 20)
                                         .background(Color.white.opacity(0.2))
                                     
-                                    // Compact audio slider section with fixed width
                                     HStack(spacing: 6) {
                                         Image(systemName: state.videoVolume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
                                             .foregroundColor(.white.opacity(0.8))
@@ -1016,7 +1268,6 @@ struct SlideshowView: View {
                                     utilityButtons
                                 }
                             } else {
-                                // Two-row layout for image slideshows or standard/smaller video windows
                                 HStack(spacing: 16) {
                                     controlButtons
                                     
@@ -1030,7 +1281,6 @@ struct SlideshowView: View {
                                     utilityButtons
                                 }
                                 
-                                // Row 2: Timeline & Audio Controls
                                 if let current = state.selectedItem, current.isVideo {
                                     Divider()
                                         .background(Color.white.opacity(0.2))
@@ -1045,7 +1295,8 @@ struct SlideshowView: View {
                                                 get: { min(max(0, state.videoCurrentTime), state.videoDuration) },
                                                 set: { newValue in
                                                     state.videoCurrentTime = newValue
-                                                    state.scrubTargetTime = newValue
+                                                    let target = CMTime(seconds: newValue, preferredTimescale: 600)
+                                                    state.sharedPlayerViewModel.player?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
                                                 }
                                             ),
                                             in: 0...max(1.0, state.videoDuration),
@@ -1158,6 +1409,13 @@ struct SlideshowView: View {
                 .buttonStyle(.plain)
             Button(state.isPaused ? "Play" : "Pause") {
                 state.isPaused.toggle()
+                if let current = state.selectedItem, current.isVideo {
+                    if state.isPaused {
+                        state.sharedPlayerViewModel.player?.pause()
+                    } else {
+                        state.sharedPlayerViewModel.player?.play()
+                    }
+                }
                 state.resetTimer()
             }
             .buttonStyle(.plain)
@@ -1169,6 +1427,14 @@ struct SlideshowView: View {
     @ViewBuilder
     private var utilityButtons: some View {
         Group {
+            if !state.isFullScreen {
+                Button(action: { PiPManager.shared.togglePiP(for: state) }) {
+                    Image(systemName: "pip.enter")
+                }
+                .buttonStyle(.plain)
+                .help("Toggle Picture-in-Picture (P)")
+            }
+
             Button(action: { state.toggleFullScreen() }) {
                 Image(systemName: state.isFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
             }
@@ -1221,7 +1487,7 @@ struct SlideshowView: View {
     }
 }
 
-// MARK: - Root View & Key Bindings via Window-Level NSEvent Monitor
+// MARK: - Root View & Key Bindings
 struct ContentView: View {
     @ObservedObject var state: AppState
     @State private var keyMonitor: Any?
@@ -1248,7 +1514,8 @@ struct ContentView: View {
         .onAppear {
             if keyMonitor == nil {
                 keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                    guard let currentWindow = NSApp.keyWindow, currentWindow === event.window || NSApp.windows.contains(where: { $0 === event.window }) else {
+                    let targetWindow = NSApp.keyWindow ?? NSApp.windows.first
+                    guard let currentWindow = targetWindow, currentWindow === event.window || NSApp.windows.contains(where: { $0 === event.window }) else {
                         return event
                     }
                     
@@ -1262,6 +1529,11 @@ struct ContentView: View {
                     
                     if characters == "f" {
                         state.toggleFullScreen()
+                        return nil
+                    }
+                    
+                    if characters == "p" {
+                        PiPManager.shared.togglePiP(for: state)
                         return nil
                     }
                     
@@ -1319,13 +1591,24 @@ struct ContentView: View {
                         
                     case 49: // Spacebar
                         state.triggerControls()
-                        if state.isSlideshowActive {
+                        if state.isSlideshowActive || PiPManager.shared.isPiPActive {
                             state.isPaused.toggle()
+                            if let current = state.selectedItem, current.isVideo {
+                                if state.isPaused {
+                                    state.sharedPlayerViewModel.player?.pause()
+                                } else {
+                                    state.sharedPlayerViewModel.player?.play()
+                                }
+                            }
                             state.resetTimer()
                         }
                         return nil
                         
                     case 53: // Escape
+                        if PiPManager.shared.isPiPActive {
+                            PiPManager.shared.closePiP()
+                            return nil
+                        }
                         if state.isSlideshowActive {
                             state.exitSlideshow()
                         } else if state.currentFolder != nil {
