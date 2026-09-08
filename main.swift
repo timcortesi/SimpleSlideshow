@@ -745,7 +745,13 @@ final class AppState: ObservableObject {
     
     private func parseDirectoryAsync(_ target: URL, resetIndex: Bool) async {
         isLoadingDirectory = true
-        defer { isLoadingDirectory = false }
+        defer { 
+            isLoadingDirectory = false 
+            // Double check window mode after loading complete
+            if !isSlideshowActive && currentFolder != nil {
+                WindowManager.updateWindowForMode(.browser)
+            }
+        }
         
         if activeFolderSecurityScope != nil {
             activeFolderSecurityScope?.stopAccessingSecurityScopedResource()
@@ -1056,11 +1062,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.titlebarAppearsTransparent = true
             window.backgroundColor = .windowBackgroundColor
             window.delegate = self
-            let layoutSpec = WindowManager.spec(for: .dropzone)
-            window.setContentSize(NSSize(width: layoutSpec.width, height: layoutSpec.height))
-            window.minSize = NSSize(width: layoutSpec.minWidth, height: layoutSpec.minHeight)
-            window.maxSize = NSSize(width: layoutSpec.maxWidth, height: layoutSpec.maxHeight)
-            window.styleMask.remove(.resizable)
+            
+            // Bypass dropzone window if launched with a dropped folder/file
+            let initialMode: WindowInteractionMode = (pendingURL != nil) ? .browser : .dropzone
+            WindowManager.updateWindowForMode(initialMode)
         }
         
         NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { _ in
@@ -1349,7 +1354,6 @@ struct PDFSlideView: View {
         }
     }
     
-    // Add `nonisolated` here:
     nonisolated static func renderPDFPage(url: URL, pageIndex: Int) -> NSImage? {
         let pdfKey = ThumbnailCache.pdfKey(for: url, page: pageIndex)
         if let cached = ThumbnailCache.shared.object(forKey: pdfKey) {
