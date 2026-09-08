@@ -44,7 +44,7 @@ enum SupportedFormats {
         "psd", "jp2", "jxl", "exr", "hdr", "raw", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2"
     ]
     static let videos: Set<String> = [
-        "mp4", "m4v", "mov", "qt", "mkv", "avi", "mpg", "mpeg", "ts", "mts", "m2ts", "dv", "flv"
+        "mp4", "m4v", "mov", "mpg", "mpeg", "ts", "mts", "m2ts", "dv", "flv"
     ]
     static let audios: Set<String> = [
         "mp3", "m4a", "m4b", "aac", "wav", "aiff", "aif", "flac", "caf", "ac3", "au", "snd"
@@ -202,38 +202,61 @@ actor ImageLoader {
             defer { if didStart { item.url.stopAccessingSecurityScopedResource() } }
             
             if item.isAudio {
-                let image = NSImage(size: size)
-                image.lockFocus()
-                if let context = NSGraphicsContext.current?.cgContext {
-                    context.setFillColor(NSColor.darkGray.cgColor)
-                    context.fill(CGRect(origin: .zero, size: size))
+                let width = max(1, Int(size.width))
+                let height = max(1, Int(size.height))
+                let colorSpace = CGColorSpaceCreateDeviceRGB()
+                if let context = CGContext(
+                    data: nil,
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: width * 4,
+                    space: colorSpace,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                ) {
+                    context.setFillColor(red: 0.2, green: 0.2, blue: 0.2, alpha: 1)
+                    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+                    if let cgImage = context.makeImage() {
+                        let image = NSImage(cgImage: cgImage, size: size)
+                        let cost = width * height * 4
+                        ThumbnailCache.shared.setObject(image, forKey: key, cost: cost)
+                        return image
+                    }
                 }
-                image.unlockFocus()
-                let cost = Int(size.width * size.height * 4)
-                ThumbnailCache.shared.setObject(image, forKey: key, cost: cost)
-                return image
             }
 
             if item.isPDF {
                 if let doc = PDFDocument(url: item.url), let page = doc.page(at: 0) {
                     let pageRect = page.bounds(for: .mediaBox)
-                    let image = NSImage(size: size)
-                    image.lockFocus()
-                    if let context = NSGraphicsContext.current?.cgContext {
-                        context.setFillColor(NSColor.white.cgColor)
-                        context.fill(CGRect(origin: .zero, size: size))
+                    let width = max(1, Int(size.width))
+                    let height = max(1, Int(size.height))
+                    let colorSpace = CGColorSpaceCreateDeviceRGB()
+                    if let context = CGContext(
+                        data: nil,
+                        width: width,
+                        height: height,
+                        bitsPerComponent: 8,
+                        bytesPerRow: width * 4,
+                        space: colorSpace,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                    ) {
+                        context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+                        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
                         
-                        let targetRect = AVMakeRect(aspectRatio: pageRect.size, insideRect: CGRect(origin: .zero, size: size))
+                        let targetRect = AVMakeRect(aspectRatio: pageRect.size, insideRect: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
                         context.saveGState()
                         context.translateBy(x: targetRect.origin.x, y: targetRect.origin.y)
                         context.scaleBy(x: targetRect.width / max(1, pageRect.width), y: targetRect.height / max(1, pageRect.height))
                         page.draw(with: .mediaBox, to: context)
                         context.restoreGState()
+                        
+                        if let cgImage = context.makeImage() {
+                            let image = NSImage(cgImage: cgImage, size: size)
+                            let cost = width * height * 4
+                            ThumbnailCache.shared.setObject(image, forKey: key, cost: cost)
+                            return image
+                        }
                     }
-                    image.unlockFocus()
-                    let cost = Int(size.width * size.height * 4)
-                    ThumbnailCache.shared.setObject(image, forKey: key, cost: cost)
-                    return image
                 }
             }
             
@@ -587,6 +610,7 @@ final class AppState: ObservableObject {
             if PiPManager.shared.isPiPActive {
                 PiPManager.shared.updatePiPContentSize(for: self)
             }
+            preloadAdjacentPDFPages()
         }
     }
     @Published var totalDocumentPages: Int = 1
@@ -668,6 +692,7 @@ final class AppState: ObservableObject {
         if let doc = PDFDocument(url: item.url) {
             currentPDFDocument = doc
             totalDocumentPages = max(1, doc.pageCount)
+            preloadAdjacentPDFPages()
         } else {
             currentPDFDocument = nil
             totalDocumentPages = 1
@@ -969,6 +994,21 @@ final class AppState: ObservableObject {
         isFullScreen = fullScreen
     }
     
+    private func preloadAdjacentPDFPages() {
+        guard let item = selectedItem, item.isPDF else { return }
+        let url = item.url
+        let currentPage = currentDocumentPage
+        let totalPages = totalDocumentPages
+        
+        Task.detached(priority: .userInitiated) {
+            for page in [currentPage, currentPage + 1, currentPage - 1] {
+                if page >= 0 && page < totalPages {
+                    _ = PDFSlideView.renderPDFPage(url: url, pageIndex: page)
+                }
+            }
+        }
+    }
+    
     private func preloadAdjacentItems() {
         guard isSlideshowActive, !items.isEmpty else { return }
         let count = items.count
@@ -979,8 +1019,14 @@ final class AppState: ObservableObject {
             let item = items[idx]
             if !item.isDirectory && !item.isVideo && !item.isAudio {
                 let url = item.url
-                Task.detached(priority: .utility) {
-                    _ = await ImageLoader.shared.loadFullImageAsync(from: url)
+                if item.isPDF {
+                    Task.detached(priority: .utility) {
+                        _ = PDFSlideView.renderPDFPage(url: url, pageIndex: 0)
+                    }
+                } else {
+                    Task.detached(priority: .utility) {
+                        _ = await ImageLoader.shared.loadFullImageAsync(from: url)
+                    }
                 }
             }
         }
@@ -1244,6 +1290,7 @@ struct PhotoSlideView: View {
     var body: some View {
         GeometryReader { geometry in
             ZStack {
+                Color.black
                 if let image = image {
                     Image(nsImage: image)
                         .resizable()
@@ -1271,14 +1318,17 @@ struct PDFSlideView: View {
         self.url = url
         self.pageIndex = pageIndex
         let pdfKey = ThumbnailCache.pdfKey(for: url, page: pageIndex)
-        let thumbKey = ThumbnailCache.key(for: url)
-        let cached = ThumbnailCache.shared.object(forKey: pdfKey) ?? ThumbnailCache.shared.object(forKey: thumbKey)
-        _pageImage = State(initialValue: cached)
+        if let cached = ThumbnailCache.shared.object(forKey: pdfKey) {
+            _pageImage = State(initialValue: cached)
+        } else {
+            _pageImage = State(initialValue: PDFSlideView.renderPDFPage(url: url, pageIndex: pageIndex))
+        }
     }
     
     var body: some View {
         GeometryReader { geometry in
             ZStack {
+                Color.black.edgesIgnoringSafeArea(.all)
                 if let image = pageImage {
                     Image(nsImage: image)
                         .resizable()
@@ -1290,35 +1340,52 @@ struct PDFSlideView: View {
             }
         }
         .task(id: "\(url.absoluteString)_p\(pageIndex)") {
-            if let rendered = await renderPDFPageAsync(url: url, pageIndex: pageIndex) {
+            if pageImage == nil {
+                let rendered = await Task.detached(priority: .userInitiated) {
+                    PDFSlideView.renderPDFPage(url: url, pageIndex: pageIndex)
+                }.value
                 self.pageImage = rendered
             }
         }
     }
     
-    private func renderPDFPageAsync(url: URL, pageIndex: Int) async -> NSImage? {
+    // Add `nonisolated` here:
+    nonisolated static func renderPDFPage(url: URL, pageIndex: Int) -> NSImage? {
         let pdfKey = ThumbnailCache.pdfKey(for: url, page: pageIndex)
         if let cached = ThumbnailCache.shared.object(forKey: pdfKey) {
             return cached
         }
-        return await Task.detached(priority: .userInitiated) { () -> NSImage? in
-            let didStart = url.startAccessingSecurityScopedResource()
-            defer { if didStart { url.stopAccessingSecurityScopedResource() } }
-            guard let doc = PDFDocument(url: url), let page = doc.page(at: pageIndex) else { return nil }
-            let pageRect = page.bounds(for: .mediaBox)
-            let image = NSImage(size: pageRect.size)
-            
-            image.lockFocus()
-            if let context = NSGraphicsContext.current?.cgContext {
-                context.setFillColor(NSColor.white.cgColor)
-                context.fill(CGRect(origin: .zero, size: pageRect.size))
-                page.draw(with: .mediaBox, to: context)
-            }
-            image.unlockFocus()
-            let cost = Int(pageRect.width * pageRect.height * 4)
-            ThumbnailCache.shared.setObject(image, forKey: pdfKey, cost: cost)
-            return image
-        }.value
+        
+        let didStart = url.startAccessingSecurityScopedResource()
+        defer { if didStart { url.stopAccessingSecurityScopedResource() } }
+        
+        guard let doc = PDFDocument(url: url), let page = doc.page(at: pageIndex) else { return nil }
+        let pageRect = page.bounds(for: .mediaBox)
+        let width = max(1, Int(pageRect.width))
+        let height = max(1, Int(pageRect.height))
+        
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        
+        context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        
+        page.draw(with: .mediaBox, to: context)
+        
+        guard let cgImage = context.makeImage() else { return nil }
+        let image = NSImage(cgImage: cgImage, size: pageRect.size)
+        
+        let cost = width * height * 4
+        ThumbnailCache.shared.setObject(image, forKey: pdfKey, cost: cost)
+        return image
     }
 }
 
