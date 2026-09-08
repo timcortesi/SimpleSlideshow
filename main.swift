@@ -4,6 +4,7 @@ import QuickLookThumbnailing
 import AppKit
 import UniformTypeIdentifiers
 import Combine
+import PDFKit
 
 // MARK: - Window Layout Configuration Model
 struct WindowLayoutSpec {
@@ -56,18 +57,32 @@ final class PiPManager {
         isTransitioning = true
         closePiP(animated: false)
 
-        if currentItem.isVideo && state.sharedPlayerViewModel.player == nil {
+        if (currentItem.isVideo || currentItem.isAudio) && state.sharedPlayerViewModel.player == nil {
             state.sharedPlayerViewModel.setupPlayer(for: currentItem.url)
             state.sharedPlayerViewModel.player?.volume = Float(state.videoVolume)
         }
 
         let maxDimension: CGFloat = 450
         var panelWidth: CGFloat = maxDimension
-        var panelHeight: CGFloat = currentItem.isVideo ? (maxDimension * 9.0 / 16.0) : 300
+        var panelHeight: CGFloat = currentItem.isAudio ? 150 : (currentItem.isVideo ? (maxDimension * 9.0 / 16.0) : 300)
         
         var naturalSize: CGSize? = nil
-        if currentItem.isVideo {
+        let didStart = currentItem.url.startAccessingSecurityScopedResource()
+        defer {
+            if didStart {
+                currentItem.url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        if currentItem.isAudio {
+            panelWidth = 350
+            panelHeight = 150
+        } else if currentItem.isVideo {
             naturalSize = state.sharedPlayerViewModel.assetNaturalSize
+        } else if currentItem.url.pathExtension.lowercased() == "pdf" {
+            if let doc = PDFDocument(url: currentItem.url), let page = doc.page(at: state.currentDocumentPage) {
+                naturalSize = page.bounds(for: .mediaBox).size
+            }
         } else {
             naturalSize = ImageLoader.loadFullImage(from: currentItem.url)?.size
         }
@@ -114,11 +129,25 @@ final class PiPManager {
         
         let maxDimension: CGFloat = 450
         var panelWidth: CGFloat = maxDimension
-        var panelHeight: CGFloat = currentItem.isVideo ? (maxDimension * 9.0 / 16.0) : 300
+        var panelHeight: CGFloat = currentItem.isAudio ? 150 : (currentItem.isVideo ? (maxDimension * 9.0 / 16.0) : 300)
         
         var naturalSize: CGSize? = nil
-        if currentItem.isVideo {
+        let didStart = currentItem.url.startAccessingSecurityScopedResource()
+        defer {
+            if didStart {
+                currentItem.url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        if currentItem.isAudio {
+            panelWidth = 350
+            panelHeight = 150
+        } else if currentItem.isVideo {
             naturalSize = state.sharedPlayerViewModel.assetNaturalSize
+        } else if currentItem.url.pathExtension.lowercased() == "pdf" {
+            if let doc = PDFDocument(url: currentItem.url), let page = doc.page(at: state.currentDocumentPage) {
+                naturalSize = page.bounds(for: .mediaBox).size
+            }
         } else {
             naturalSize = ImageLoader.loadFullImage(from: currentItem.url)?.size
         }
@@ -127,7 +156,7 @@ final class PiPManager {
             return
         }
         
-        if let size = naturalSize, size.width > 0, size.height > 0 {
+        if let size = naturalSize, size.width > 0, size.height > 0 && !currentItem.isAudio {
             if size.width >= size.height {
                 panelWidth = maxDimension
                 panelHeight = maxDimension * (size.height / size.width)
@@ -164,7 +193,7 @@ final class PiPManager {
     }
 }
 
-// MARK: - Shared Video Player Model
+// MARK: - Shared Video & Audio Player Model
 @MainActor
 final class PlayerViewModel: ObservableObject {
     @Published var player: AVPlayer?
@@ -175,11 +204,17 @@ final class PlayerViewModel: ObservableObject {
     private var endObserver: NSObjectProtocol?
     private var timeObserverToken: Any?
     private static var sizeCache: [URL: CGSize] = [:]
+    private var securityScopedURL: URL?
     
     var onVideoEnded: (() -> Void)?
     
     func setupPlayer(for url: URL) {
         cleanup()
+        
+        let didStart = url.startAccessingSecurityScopedResource()
+        if didStart {
+            securityScopedURL = url
+        }
         
         if let cachedSize = Self.sizeCache[url] {
             self.assetNaturalSize = cachedSize
@@ -253,6 +288,11 @@ final class PlayerViewModel: ObservableObject {
         assetNaturalSize = nil
         currentTime = 0
         duration = 1
+        
+        if let url = securityScopedURL {
+            url.stopAccessingSecurityScopedResource()
+            securityScopedURL = nil
+        }
     }
 }
 
@@ -265,9 +305,16 @@ struct PiPContainerView: View {
         ZStack {
             Color.black
             if let current = state.selectedItem, !current.isDirectory {
-                if current.isVideo {
+                let ext = current.url.pathExtension.lowercased()
+                if current.isAudio {
+                    AudioSlideView(url: current.url, viewModel: state.sharedPlayerViewModel)
+                        .id(current.id)
+                } else if current.isVideo {
                     SharedVideoView(viewModel: state.sharedPlayerViewModel, gravity: .resizeAspect)
                         .id(current.id)
+                } else if ext == "pdf" {
+                    PDFSlideView(url: current.url, pageIndex: state.currentDocumentPage)
+                        .id("\(current.id)_p\(state.currentDocumentPage)")
                 } else {
                     PhotoSlideView(url: current.url)
                         .id(current.id)
@@ -295,14 +342,12 @@ struct PiPContainerView: View {
                     if let current = state.selectedItem, !current.isDirectory {
                         Button(action: {
                             state.isPaused.toggle()
-                            if current.isVideo {
+                            if current.isVideo || current.isAudio {
                                 if state.isPaused {
                                     state.sharedPlayerViewModel.player?.pause()
                                 } else {
                                     state.sharedPlayerViewModel.player?.play()
                                 }
-                            } else {
-                                // Pause the slideshow timer
                             }
                             state.resetTimer()
                         }) {
@@ -336,9 +381,10 @@ struct PiPContainerView: View {
             }
         }
         .onChange(of: state.selectedIndex) { _, _ in
-            if let current = state.selectedItem, !current.isVideo {
-                PiPManager.shared.updatePiPContentSize(for: state)
-            }
+            PiPManager.shared.updatePiPContentSize(for: state)
+        }
+        .onChange(of: state.currentDocumentPage) { _, _ in
+            PiPManager.shared.updatePiPContentSize(for: state)
         }
     }
 }
@@ -443,6 +489,7 @@ struct MediaItem: Identifiable, Hashable {
     let name: String
     let isDirectory: Bool
     let isVideo: Bool
+    let isAudio: Bool
     
     var isMedia: Bool { !isDirectory }
 }
@@ -463,24 +510,74 @@ actor ImageLoader {
         }
         
         let scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
+        
+        let ext = item.url.pathExtension.lowercased()
+        let validImageExts = [
+            "png", "jpg", "jpeg", "gif", "bmp", "webp", "heic", "heif", "tiff", "tif", "ico", "svg",
+            "psd", "jp2", "jxl", "exr", "hdr",
+            "raw", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2"
+        ]
+        let validVideoExts = [
+            "mp4", "m4v", "mov", "qt", "mkv", "avi", "mpg", "mpeg", "ts", "mts", "m2ts", "dv", "flv"
+        ]
+        let validAudioExts = ["mp3", "m4a", "aac", "wav", "aiff", "aif", "flac", "caf", "ac3", "au", "snd"]
+        let validDocExts = ["pdf"]
+         
+        let didStart = item.url.startAccessingSecurityScopedResource()
+        defer {
+            if didStart {
+                item.url.stopAccessingSecurityScopedResource()
+            }
+        }
+        
+        if item.isAudio {
+            let image = NSImage(size: size)
+            image.lockFocus()
+            if let context = NSGraphicsContext.current?.cgContext {
+                context.setFillColor(NSColor.darkGray.cgColor)
+                context.fill(CGRect(origin: .zero, size: size))
+            }
+            image.unlockFocus()
+            ThumbnailCache.shared.setObject(image, forKey: key)
+            return image
+        }
+
+        if ext == "pdf" {
+            if let doc = PDFDocument(url: item.url), let page = doc.page(at: 0) {
+                let pageRect = page.bounds(for: .mediaBox)
+                let image = NSImage(size: size)
+                image.lockFocus()
+                if let context = NSGraphicsContext.current?.cgContext {
+                    context.setFillColor(NSColor.white.cgColor)
+                    context.fill(CGRect(origin: .zero, size: size))
+                    
+                    let targetRect = AVMakeRect(aspectRatio: pageRect.size, insideRect: CGRect(origin: .zero, size: size))
+                    context.saveGState()
+                    context.translateBy(x: targetRect.origin.x, y: targetRect.origin.y)
+                    context.scaleBy(x: targetRect.width / pageRect.width, y: targetRect.height / pageRect.height)
+                    page.draw(with: .mediaBox, to: context)
+                    context.restoreGState()
+                }
+                image.unlockFocus()
+                ThumbnailCache.shared.setObject(image, forKey: key)
+                return image
+            }
+        }
+        
         let request = QLThumbnailGenerator.Request(
             fileAt: item.url,
             size: size,
             scale: scale,
             representationTypes: .thumbnail
         )
-        
-        let ext = item.url.pathExtension.lowercased()
-        let validImageExts = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "heic", "tiff"]
-        let validVideoExts = ["mp4", "m4v", "mkv", "mov", "avi"]
-        
+         
         do {
             let representation = try await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
             let image = representation.nsImage
             ThumbnailCache.shared.setObject(image, forKey: key)
             return image
         } catch {
-            if !validImageExts.contains(ext) && !validVideoExts.contains(ext) {
+            if !validImageExts.contains(ext) && !validVideoExts.contains(ext) && !validAudioExts.contains(ext) && !validDocExts.contains(ext) {
                 return nil
             }
             
@@ -494,6 +591,12 @@ actor ImageLoader {
     }
     
     static func loadFullImage(from url: URL) -> NSImage? {
+        let didStart = url.startAccessingSecurityScopedResource()
+        defer {
+            if didStart {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
         guard let data = try? Data(contentsOf: url) else { return nil }
         return NSImage(data: data)
     }
@@ -518,6 +621,15 @@ final class AppState: ObservableObject {
             }
         }
     }
+    @Published var currentDocumentPage: Int = 0 {
+        didSet {
+            if PiPManager.shared.isPiPActive {
+                PiPManager.shared.updatePiPContentSize(for: self)
+            }
+        }
+    }
+    @Published var totalDocumentPages: Int = 1
+    
     @Published var isSlideshowActive: Bool = false
     @Published var isPaused: Bool = false
     @Published var delaySeconds: Int = 5
@@ -541,6 +653,8 @@ final class AppState: ObservableObject {
     }
     
     @Published var sharedPlayerViewModel = PlayerViewModel()
+    
+    private var currentPDFDocument: PDFDocument? = nil
     
     var videoCurrentTime: Double {
         get { sharedPlayerViewModel.currentTime }
@@ -620,6 +734,29 @@ final class AppState: ObservableObject {
         sharedPlayerViewModel.cleanup()
     }
     
+    func loadCurrentDocument() {
+        guard let item = selectedItem, item.url.pathExtension.lowercased() == "pdf" else {
+            currentPDFDocument = nil
+            totalDocumentPages = 1
+            return
+        }
+        
+        let didStart = item.url.startAccessingSecurityScopedResource()
+        defer {
+            if didStart {
+                item.url.stopAccessingSecurityScopedResource()
+            }
+        }
+        
+        if let doc = PDFDocument(url: item.url) {
+            currentPDFDocument = doc
+            totalDocumentPages = max(1, doc.pageCount)
+        } else {
+            currentPDFDocument = nil
+            totalDocumentPages = 1
+        }
+    }
+    
     func loadDirectory(_ url: URL, pushHistory: Bool = true) {
         NSCursor.unhide()
         PiPManager.shared.closePiP()
@@ -674,13 +811,30 @@ final class AppState: ObservableObject {
         }
         self.currentFolder = target
         
+        let didStart = target.startAccessingSecurityScopedResource()
+        defer {
+            if didStart {
+                target.stopAccessingSecurityScopedResource()
+            }
+        }
+        
         let keys: [URLResourceKey] = [.isDirectoryKey]
         guard let files = try? FileManager.default.contentsOfDirectory(at: target, includingPropertiesForKeys: keys, options: .skipsHiddenFiles) else {
             return
         }
         
-        let validImageExts = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "heic", "tiff"]
-        let validVideoExts = ["mp4", "mkv", "mov", "avi"]
+        let validImageExts = [
+            "png", "jpg", "jpeg", "gif", "bmp", "webp", "heic", "heif", "tiff", "tif", "ico", "svg",
+            "psd", "jp2", "jxl", "exr", "hdr",
+            "raw", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2"
+        ]
+        let validVideoExts = [
+            "mp4", "m4v", "mov", "qt", "mkv", "avi", "mpg", "mpeg", "ts", "mts", "m2ts", "dv", "flv"
+        ]
+        let validAudioExts = [
+            "mp3", "m4a", "m4b", "aac", "wav", "aiff", "aif", "flac", "caf", "ac3", "au", "snd"
+        ]
+        let validDocExts = ["pdf"]
         
         var folderItems: [MediaItem] = []
         var mediaItems: [MediaItem] = []
@@ -691,11 +845,13 @@ final class AppState: ObservableObject {
             let ext = file.pathExtension.lowercased()
             
             if isDirectory {
-                folderItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: true, isVideo: false))
-            } else if validImageExts.contains(ext) {
-                mediaItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: false, isVideo: false))
+                folderItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: true, isVideo: false, isAudio: false))
+            } else if validImageExts.contains(ext) || validDocExts.contains(ext) {
+                mediaItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: false, isVideo: false, isAudio: false))
             } else if validVideoExts.contains(ext) {
-                mediaItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: false, isVideo: true))
+                mediaItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: false, isVideo: true, isAudio: false))
+            } else if validAudioExts.contains(ext) {
+                mediaItems.append(MediaItem(url: file, name: file.lastPathComponent, isDirectory: false, isVideo: false, isAudio: true))
             }
         }
         
@@ -742,8 +898,10 @@ final class AppState: ObservableObject {
         updateWindowForMode(.slideshow)
         resetVideoState()
         isSlideshowActive = true
+        currentDocumentPage = 0
+        loadCurrentDocument()
         
-        if item.isVideo {
+        if item.isVideo || item.isAudio {
             sharedPlayerViewModel.setupPlayer(for: item.url)
             sharedPlayerViewModel.player?.volume = Float(videoVolume)
         }
@@ -771,6 +929,25 @@ final class AppState: ObservableObject {
         }
         resetVideoState()
         
+        let currentItem = selectedItem
+        
+        if let current = currentItem, current.url.pathExtension.lowercased() == "pdf" {
+            if currentPDFDocument == nil {
+                loadCurrentDocument()
+            }
+            
+            let nextPage = currentDocumentPage + delta
+            if nextPage >= 0 && nextPage < totalDocumentPages {
+                currentDocumentPage = nextPage
+                resetTimer()
+                return
+            } else if nextPage >= totalDocumentPages && delta > 0 {
+                currentDocumentPage = 0
+            } else if nextPage < 0 && delta < 0 {
+                currentDocumentPage = 0
+            }
+        }
+        
         var newIndex = selectedIndex
         let count = items.count
         
@@ -788,13 +965,15 @@ final class AppState: ObservableObject {
         }
         
         selectedIndex = newIndex
+        currentDocumentPage = 0
+        loadCurrentDocument()
         
         if selectedItem?.isDirectory == true {
             exitSlideshow()
             return
         }
         
-        if let current = selectedItem, current.isVideo {
+        if let current = selectedItem, (current.isVideo || current.isAudio) {
             sharedPlayerViewModel.setupPlayer(for: current.url)
             sharedPlayerViewModel.player?.volume = Float(videoVolume)
         }
@@ -869,7 +1048,7 @@ final class AppState: ObservableObject {
     
     func resetTimer() {
         timer?.invalidate()
-        guard isSlideshowActive, !isPaused, let current = selectedItem, !current.isVideo else { return }
+        guard isSlideshowActive, !isPaused, let current = selectedItem, !current.isVideo, !current.isAudio else { return }
         timer = Timer.scheduledTimer(withTimeInterval: TimeInterval(delaySeconds), repeats: false) { [weak self] _ in
             Task { @MainActor in
                 self?.moveSlideshowSelection(by: 1, userInitiated: false)
@@ -936,6 +1115,35 @@ struct SharedVideoView: NSViewRepresentable {
     }
 }
 
+// MARK: - Audio Slide View
+struct AudioSlideView: View {
+    let url: URL
+    @ObservedObject var viewModel: PlayerViewModel
+    
+    var body: some View {
+        VStack(spacing: 20) {
+            ZStack {
+                Circle()
+                    .fill(LinearGradient(colors: [.purple, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 140, height: 140)
+                Image(systemName: "waveform")
+                    .font(.system(size: 60))
+                    .foregroundColor(.white)
+            }
+            .shadow(radius: 10)
+            
+            Text(url.lastPathComponent)
+                .font(.title2.bold())
+                .foregroundColor(.white)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 40)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black)
+    }
+}
+
 // MARK: - Photo Viewer
 struct PhotoSlideView: View {
     let url: URL
@@ -960,6 +1168,52 @@ struct PhotoSlideView: View {
     }
 }
 
+// MARK: - PDF Slide Viewer
+struct PDFSlideView: View {
+    let url: URL
+    let pageIndex: Int
+    @State private var pageImage: NSImage?
+    
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                if let image = pageImage {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                } else {
+                    ProgressView()
+                }
+            }
+        }
+        .task(id: "\(url.absoluteString)_p\(pageIndex)") {
+            pageImage = renderPDFPage(url: url, pageIndex: pageIndex)
+        }
+    }
+    
+    private func renderPDFPage(url: URL, pageIndex: Int) -> NSImage? {
+        let didStart = url.startAccessingSecurityScopedResource()
+        defer {
+            if didStart {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        guard let doc = PDFDocument(url: url), let page = doc.page(at: pageIndex) else { return nil }
+        let pageRect = page.bounds(for: .mediaBox)
+        let image = NSImage(size: pageRect.size)
+        
+        image.lockFocus()
+        if let context = NSGraphicsContext.current?.cgContext {
+            context.setFillColor(NSColor.white.cgColor)
+            context.fill(CGRect(origin: .zero, size: pageRect.size))
+            page.draw(with: .mediaBox, to: context)
+        }
+        image.unlockFocus()
+        return image
+    }
+}
+
 // MARK: - Views
 struct DropzoneView: View {
     @ObservedObject var state: AppState
@@ -975,11 +1229,11 @@ struct DropzoneView: View {
                 .buttonStyle(.plain)
                 .padding()
             }
-            Text("📷").font(.system(size: 80))
+            Text("📁").font(.system(size: 80))
             Text("Drop Media or Folders Here").font(.largeTitle.bold())
-            Text("Drag & drop images, videos, or click below").font(.title3).foregroundColor(.secondary)
+            Text("Supports images, videos, audio, and PDFs").font(.title3).foregroundColor(.secondary)
             
-            Button("📁 Choose Folder") {
+            Button("📂 Choose Folder") {
                 let panel = NSOpenPanel()
                 panel.canChooseDirectories = true
                 panel.canChooseFiles = true
@@ -1022,6 +1276,22 @@ struct GalleryCardView: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
+            } else if item.isAudio {
+                VStack(spacing: 6) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(LinearGradient(colors: [.purple.opacity(0.7), .blue.opacity(0.7)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        Image(systemName: "waveform")
+                            .font(.system(size: 48))
+                            .foregroundColor(.white)
+                    }
+                    .frame(width: 224, height: 145)
+                    
+                    Text(item.name)
+                        .font(.caption.bold())
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
             } else if item.isVideo {
                 VStack(spacing: 6) {
                     Group {
@@ -1045,19 +1315,26 @@ struct GalleryCardView: View {
                     thumbnail = await ImageLoader.loadThumbnail(for: item, size: CGSize(width: 448, height: 290))
                 }
             } else {
-                Group {
-                    if let thumbnail = thumbnail {
-                        Image(nsImage: thumbnail)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: 224, height: 184)
-                    } else {
-                        ProgressView()
+                VStack(spacing: 6) {
+                    Group {
+                        if let thumbnail = thumbnail {
+                            Image(nsImage: thumbnail)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 224, height: 160)
+                        } else {
+                            ProgressView()
+                        }
                     }
+                    
+                    Text(item.name)
+                        .font(.caption.bold())
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
                 .task(id: item.url) {
                     thumbnail = nil
-                    thumbnail = await ImageLoader.loadThumbnail(for: item, size: CGSize(width: 448, height: 368))
+                    thumbnail = await ImageLoader.loadThumbnail(for: item, size: CGSize(width: 448, height: 320))
                 }
             }
         }
@@ -1182,9 +1459,16 @@ struct SlideshowView: View {
             Color.black.edgesIgnoringSafeArea(.all)
             
             if let current = state.selectedItem, !current.isDirectory {
-                if current.isVideo {
+                let ext = current.url.pathExtension.lowercased()
+                if current.isAudio {
+                    AudioSlideView(url: current.url, viewModel: state.sharedPlayerViewModel)
+                        .id(current.id)
+                } else if current.isVideo {
                     SharedVideoView(viewModel: state.sharedPlayerViewModel, gravity: .resizeAspect)
                         .id(current.id)
+                } else if ext == "pdf" {
+                    PDFSlideView(url: current.url, pageIndex: state.currentDocumentPage)
+                        .id("\(current.id)_p\(state.currentDocumentPage)")
                 } else {
                     PhotoSlideView(url: current.url)
                         .id(current.id)
@@ -1194,12 +1478,12 @@ struct SlideshowView: View {
             if showControls {
                 GeometryReader { proxy in
                     let totalWidth = proxy.size.width
-                    let isVideo = state.selectedItem?.isVideo ?? false
-                    let isReallyWideVideo = isVideo && totalWidth > 900
+                    let isMediaPlayback = (state.selectedItem?.isVideo ?? false) || (state.selectedItem?.isAudio ?? false)
+                    let isReallyWideMedia = isMediaPlayback && totalWidth > 900
                     let isWide = totalWidth > 600
                     
-                    let panelWidth: CGFloat = isVideo
-                        ? (isReallyWideVideo ? min(totalWidth * 0.90, 900) : (isWide ? totalWidth * 0.90 : totalWidth - 32))
+                    let panelWidth: CGFloat = isMediaPlayback
+                        ? (isReallyWideMedia ? min(totalWidth * 0.90, 900) : (isWide ? totalWidth * 0.90 : totalWidth - 32))
                         : (isWide ? min(totalWidth * 0.9, 500) : totalWidth - 32)
                     
                     let isCompactAudio = totalWidth < 600
@@ -1208,7 +1492,7 @@ struct SlideshowView: View {
                         Spacer()
                         
                         VStack(spacing: 12) {
-                            if isReallyWideVideo {
+                            if isReallyWideMedia {
                                 HStack(spacing: 16) {
                                     controlButtons
                                     
@@ -1274,14 +1558,20 @@ struct SlideshowView: View {
                                     Spacer()
                                     
                                     if let current = state.selectedItem, !current.isDirectory {
-                                        Stepper("Delay: \(state.delaySeconds)s", value: $state.delaySeconds, in: 1...60)
-                                            .onChange(of: state.delaySeconds) { state.resetTimer() }
+                                        if current.url.pathExtension.lowercased() == "pdf" {
+                                            Text("Page \(state.currentDocumentPage + 1) of \(state.totalDocumentPages)")
+                                                .font(.caption.bold())
+                                                .foregroundColor(.white.opacity(0.8))
+                                        } else if !current.isVideo && !current.isAudio {
+                                            Stepper("Delay: \(state.delaySeconds)s", value: $state.delaySeconds, in: 1...60)
+                                                .onChange(of: state.delaySeconds) { state.resetTimer() }
+                                        }
                                     }
                                     
                                     utilityButtons
                                 }
                                 
-                                if let current = state.selectedItem, current.isVideo {
+                                if let current = state.selectedItem, current.isVideo || current.isAudio {
                                     Divider()
                                         .background(Color.white.opacity(0.2))
                                     
@@ -1413,7 +1703,7 @@ struct SlideshowView: View {
             
             Button(action: {
                 state.isPaused.toggle()
-                if let current = state.selectedItem, current.isVideo {
+                if let current = state.selectedItem, current.isVideo || current.isAudio {
                     if state.isPaused {
                         state.sharedPlayerViewModel.player?.pause()
                     } else {
@@ -1571,7 +1861,7 @@ struct ContentView: View {
                         
                     case 125: // Down Arrow
                         if state.isSlideshowActive {
-                            if let current = state.selectedItem, current.isVideo {
+                            if let current = state.selectedItem, current.isVideo || current.isAudio {
                                 state.adjustVolume(by: -0.1)
                             } else {
                                 state.adjustDelay(by: -1)
@@ -1584,7 +1874,7 @@ struct ContentView: View {
                     case 126: // Up Arrow
                         if state.isSlideshowActive {
                             let current = state.selectedItem
-                            if current?.isVideo == true {
+                            if current?.isVideo == true || current?.isAudio == true {
                                 state.adjustVolume(by: 0.1)
                             } else {
                                 state.adjustDelay(by: 1)
@@ -1605,7 +1895,7 @@ struct ContentView: View {
                         state.triggerControls()
                         if state.isSlideshowActive || PiPManager.shared.isPiPActive {
                             state.isPaused.toggle()
-                            if let current = state.selectedItem, current.isVideo {
+                            if let current = state.selectedItem, current.isVideo || current.isAudio {
                                 if state.isPaused {
                                     state.sharedPlayerViewModel.player?.pause()
                                 } else {
