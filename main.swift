@@ -488,7 +488,7 @@ final class PlayerViewModel: ObservableObject {
             object: playerItem,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 guard let self = self else { return }
                 self.removeEndObserver()
                 self.onVideoEnded?()
@@ -501,7 +501,7 @@ final class PlayerViewModel: ObservableObject {
         
         let interval = CMTime(seconds: LayoutConstants.periodicTimeInterval, preferredTimescale: 600)
         let token = newPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 guard let self = self, self.player === newPlayer else { return }
                 guard !self.isScrubbing else { return }
                 self.currentTime = time.seconds
@@ -573,6 +573,7 @@ final class AppState: ObservableObject {
     @Published var currentFolder: URL?
     @Published var folderHistory: [FolderState] = []
     @Published var items: [MediaItem] = []
+    @Published var isLoadingDirectory: Bool = false
     @Published var selectedIndex: Int = 0 {
         didSet {
             if PiPManager.shared.isPiPActive {
@@ -718,6 +719,9 @@ final class AppState: ObservableObject {
     }
     
     private func parseDirectoryAsync(_ target: URL, resetIndex: Bool) async {
+        isLoadingDirectory = true
+        defer { isLoadingDirectory = false }
+        
         if activeFolderSecurityScope != nil {
             activeFolderSecurityScope?.stopAccessingSecurityScopedResource()
             activeFolderSecurityScope = nil
@@ -809,6 +813,7 @@ final class AppState: ObservableObject {
         WindowManager.updateWindowForMode(.slideshow)
         resetVideoState()
         isSlideshowActive = true
+        isPaused = false
         currentDocumentPage = 0
         loadCurrentDocument()
         
@@ -896,22 +901,20 @@ final class AppState: ObservableObject {
         resetVideoState()
         
         let cols = max(1, gridColumnsCount)
-        let currentRow = selectedIndex / cols
-        let currentCol = selectedIndex % cols
         
         if horizontal != 0 {
-            let newCol = currentCol + horizontal
-            if newCol >= 0 && newCol < cols {
-                let newIndex = currentRow * cols + newCol
-                if newIndex < items.count { selectedIndex = newIndex }
+            let newIndex = selectedIndex + horizontal
+            if newIndex >= 0 && newIndex < items.count {
+                selectedIndex = newIndex
             }
         } else if vertical != 0 {
-            let newRow = currentRow + vertical
-            let maxRow = (items.count - 1) / cols
-            if newRow >= 0 && newRow <= maxRow {
-                let targetCol = min(currentCol, (newRow == maxRow) ? ((items.count - 1) % cols) : (cols - 1))
-                let newIndex = newRow * cols + targetCol
-                if newIndex < items.count { selectedIndex = newIndex }
+            let newIndex = selectedIndex + (vertical * cols)
+            if newIndex >= 0 && newIndex < items.count {
+                selectedIndex = newIndex
+            } else if vertical > 0 && selectedIndex < items.count - 1 {
+                selectedIndex = items.count - 1
+            } else if vertical < 0 && selectedIndex > 0 {
+                selectedIndex = 0
             }
         }
     }
@@ -929,7 +932,7 @@ final class AppState: ObservableObject {
         let targetSeconds = min(max(0, player.currentTime().seconds + totalOffset), maxDuration)
         let targetTime = CMTime(seconds: targetSeconds, preferredTimescale: 600)
         
-        player.seek(to: targetTime, toleranceBefore: CMTime(seconds: 0.2, preferredTimescale: 600), toleranceAfter: CMTime(seconds: 0.2, preferredTimescale: 600))
+        player.seek(to: targetTime, toleranceBefore: CMTime(seconds: 0.1, preferredTimescale: 600), toleranceAfter: CMTime(seconds: 0.1, preferredTimescale: 600))
     }
     
     func adjustDelay(by seconds: Int) {
@@ -1113,7 +1116,12 @@ struct PiPContainerView: View {
                         Button(action: { PiPManager.shared.closePiP(state: state) }) {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.title2)
-                                .foregroundColor(.white.opacity(0.8))
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(
+                                    state.isDarkMode ? Color.white : Color.black,
+                                    state.isDarkMode ? Color.black.opacity(0.7) : Color.white.opacity(0.9)
+                                )
+                                .shadow(color: state.isDarkMode ? .black.opacity(0.3) : .white.opacity(0.3), radius: 2)
                         }
                         .buttonStyle(.plain)
                         .padding(10)
@@ -1136,7 +1144,12 @@ struct PiPContainerView: View {
                         }) {
                             Image(systemName: state.isPaused ? "play.circle.fill" : "pause.circle.fill")
                                 .font(.system(size: 44))
-                                .foregroundColor(.white.opacity(0.9))
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(
+                                    state.isDarkMode ? Color.white : Color.black,
+                                    state.isDarkMode ? Color.black.opacity(0.7) : Color.white.opacity(0.9)
+                                )
+                                .shadow(color: state.isDarkMode ? .black.opacity(0.3) : .white.opacity(0.3), radius: 4)
                         }
                         .buttonStyle(.plain)
                         .padding(.bottom, 20)
@@ -1358,6 +1371,15 @@ struct GalleryCardView: View {
     @State private var thumbnail: NSImage?
     @State private var isHovered: Bool = false
     
+    init(item: MediaItem, isSelected: Bool, isDarkMode: Bool, action: @escaping () -> Void) {
+        self.item = item
+        self.isSelected = isSelected
+        self.isDarkMode = isDarkMode
+        self.action = action
+        let key = ThumbnailCache.key(for: item.url)
+        _thumbnail = State(initialValue: ThumbnailCache.shared.object(forKey: key))
+    }
+    
     var body: some View {
         let activeColor = isHovered ? Color.green : (isSelected ? Color.blue : Color.clear)
         let bgColor = isHovered ? Color.green.opacity(0.3) : (isSelected ? Color.blue.opacity(0.4) : (isDarkMode ? Color.white.opacity(0.1) : Color.black.opacity(0.05)))
@@ -1406,8 +1428,9 @@ struct GalleryCardView: View {
                         .truncationMode(.tail)
                 }
                 .task(id: item.url) {
-                    thumbnail = nil
-                    thumbnail = await ImageLoader.shared.loadThumbnail(for: item, size: CGSize(width: LayoutConstants.thumbnailLargeWidth, height: LayoutConstants.thumbnailLargeHeight))
+                    if thumbnail == nil {
+                        thumbnail = await ImageLoader.shared.loadThumbnail(for: item, size: CGSize(width: LayoutConstants.thumbnailLargeWidth, height: LayoutConstants.thumbnailLargeHeight))
+                    }
                 }
             } else {
                 VStack(spacing: 6) {
@@ -1428,8 +1451,9 @@ struct GalleryCardView: View {
                         .truncationMode(.tail)
                 }
                 .task(id: item.url) {
-                    thumbnail = nil
-                    thumbnail = await ImageLoader.shared.loadThumbnail(for: item, size: CGSize(width: LayoutConstants.thumbnailLargeWidth, height: 320))
+                    if thumbnail == nil {
+                        thumbnail = await ImageLoader.shared.loadThumbnail(for: item, size: CGSize(width: LayoutConstants.thumbnailLargeWidth, height: 320))
+                    }
                 }
             }
         }
@@ -1501,30 +1525,51 @@ struct GalleryView: View {
                     .padding(.bottom, 8)
             }
             
-            GeometryReader { geometry in
-                let availableWidth = geometry.size.width - 40
-                let cols = max(1, Int(availableWidth / LayoutConstants.cardWidth))
-                
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVGrid(columns: Array(repeating: GridItem(.fixed(240), spacing: 24), count: cols), spacing: 24) {
-                            ForEach(Array(state.items.enumerated()), id: \.element.id) { index, item in
-                                GalleryCardView(item: item, isSelected: index == state.selectedIndex, isDarkMode: state.isDarkMode) {
-                                    state.startSlideshow(at: index)
+            if state.isLoadingDirectory {
+                VStack(spacing: 16) {
+                    ProgressView()
+                        .controlSize(.large)
+                    Text("Loading \(state.currentFolder?.lastPathComponent ?? "Folder")...")
+                        .font(.title3.weight(.medium))
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if state.items.isEmpty {
+                VStack(spacing: 12) {
+                    Image(systemName: "folder.badge.questionmark")
+                        .font(.system(size: 48))
+                        .foregroundColor(.secondary)
+                    Text("No supported media files found")
+                        .font(.headline)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                GeometryReader { geometry in
+                    let availableWidth = geometry.size.width - 40
+                    let cols = max(1, Int(availableWidth / LayoutConstants.cardWidth))
+                    
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVGrid(columns: Array(repeating: GridItem(.fixed(240), spacing: 24), count: cols), spacing: 24) {
+                                ForEach(Array(state.items.enumerated()), id: \.element.id) { index, item in
+                                    GalleryCardView(item: item, isSelected: index == state.selectedIndex, isDarkMode: state.isDarkMode) {
+                                        state.startSlideshow(at: index)
+                                    }
+                                    .id(index)
                                 }
-                                .id(index)
                             }
+                            .padding()
                         }
-                        .padding()
-                    }
-                    .id(state.currentFolder)
-                    .onAppear {
-                        state.gridColumnsCount = cols
-                        proxy.scrollTo(state.selectedIndex, anchor: .center)
-                    }
-                    .onChange(of: cols) { _, _ in state.gridColumnsCount = cols }
-                    .onChange(of: state.selectedIndex) { _, newIndex in
-                        proxy.scrollTo(newIndex, anchor: .center)
+                        .id(state.currentFolder)
+                        .onAppear {
+                            state.gridColumnsCount = cols
+                            proxy.scrollTo(state.selectedIndex, anchor: .center)
+                        }
+                        .onChange(of: cols) { _, _ in state.gridColumnsCount = cols }
+                        .onChange(of: state.selectedIndex) { _, newIndex in
+                            proxy.scrollTo(newIndex, anchor: .center)
+                        }
                     }
                 }
             }
@@ -1562,7 +1607,7 @@ struct MediaScrubberView: View {
                     set: { newValue in
                         playerViewModel.currentTime = newValue
                         let target = CMTime(seconds: newValue, preferredTimescale: 600)
-                        playerViewModel.player?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+                        playerViewModel.player?.seek(to: target, toleranceBefore: CMTime(seconds: 0.1, preferredTimescale: 600), toleranceAfter: CMTime(seconds: 0.1, preferredTimescale: 600))
                     }
                 ),
                 in: 0...max(1.0, playerViewModel.duration),
@@ -1683,7 +1728,7 @@ struct SlideshowControlBar: View {
     private var controlButtons: some View {
         Group {
             Button(action: { state.moveSlideshowSelection(by: -1) }) {
-                Image(systemName: "backward.fill")
+                Image(systemName: "backward.end.fill")
             }
             .buttonStyle(.plain)
             .help("Previous Item")
@@ -1705,7 +1750,7 @@ struct SlideshowControlBar: View {
             .help(state.isPaused ? "Play" : "Pause")
             
             Button(action: { state.moveSlideshowSelection(by: 1) }) {
-                Image(systemName: "forward.fill")
+                Image(systemName: "forward.end.fill")
             }
             .buttonStyle(.plain)
             .help("Next Item")
@@ -1763,6 +1808,7 @@ struct SlideshowView: View {
     @State private var cursorHideTimer: Timer?
     @State private var isCursorHidden = false
     @State private var showVolumePopover = false
+    @State private var lastMouseActivityTime = Date.distantPast
     
     init(state: AppState) {
         self.state = state
@@ -1770,19 +1816,25 @@ struct SlideshowView: View {
     }
     
     var body: some View {
-        ZStack {
-            Color.black.edgesIgnoringSafeArea(.all)
-            
-            if let current = state.selectedItem, !current.isDirectory {
-                MediaSlideContentView(
-                    item: current,
-                    pageIndex: state.currentDocumentPage,
-                    playerViewModel: playerViewModel
-                )
-            }
-            
-            if showControls {
-                GeometryReader { proxy in
+        GeometryReader { proxy in
+            ZStack {
+                Color.black.edgesIgnoringSafeArea(.all)
+                    .onTapGesture(count: 2) {
+                        state.toggleFullScreen()
+                    }
+                    .onTapGesture(count: 1) {
+                        handleMouseActivity()
+                    }
+                
+                if let current = state.selectedItem, !current.isDirectory {
+                    MediaSlideContentView(
+                        item: current,
+                        pageIndex: state.currentDocumentPage,
+                        playerViewModel: playerViewModel
+                    )
+                }
+                
+                if showControls {
                     VStack {
                         Spacer()
                         SlideshowControlBar(
@@ -1792,20 +1844,25 @@ struct SlideshowView: View {
                             totalWidth: proxy.size.width
                         )
                         .padding(.bottom, state.isFullScreen ? 75 : 16)
-                        .frame(maxWidth: .infinity, alignment: .center)
                     }
+                    .transition(.opacity)
                 }
-                .transition(.opacity)
             }
         }
         .environment(\.colorScheme, .dark)
-        .onTapGesture(count: 2) { state.toggleFullScreen() }
-        .onContinuousHover { _ in handleMouseActivity() }
+        .onContinuousHover { phase in
+            switch phase {
+            case .active:
+                handleMouseActivity()
+            case .ended:
+                break
+            }
+        }
         .onAppear {
-            showControls = false
+            showControls = true
             NSCursor.unhide()
             isCursorHidden = false
-            startCursorHideTimer()
+            resetAutoHideTimers()
         }
         .onDisappear {
             NSCursor.unhide()
@@ -1819,7 +1876,7 @@ struct SlideshowView: View {
                 isCursorHidden = false
                 cursorHideTimer?.invalidate()
             } else {
-                startCursorHideTimer()
+                resetAutoHideTimers()
             }
         }
     }
@@ -1828,36 +1885,48 @@ struct SlideshowView: View {
         if isCursorHidden {
             NSCursor.unhide()
             isCursorHidden = false
-        } else {
-            NSCursor.arrow.set()
         }
-        triggerControls()
-        startCursorHideTimer()
+        
+        if !showControls {
+            withAnimation(.easeOut(duration: 0.2)) {
+                showControls = true
+            }
+        }
+        
+        let now = Date()
+        if now.timeIntervalSince(lastMouseActivityTime) > 0.25 {
+            lastMouseActivityTime = now
+            resetAutoHideTimers()
+        }
     }
     
     private func triggerControls() {
-        withAnimation { showControls = true }
+        if !showControls {
+            withAnimation(.easeOut(duration: 0.2)) { showControls = true }
+        }
+        resetAutoHideTimers()
+    }
+    
+    private func resetAutoHideTimers() {
         controlsTimer?.invalidate()
+        cursorHideTimer?.invalidate()
         
         guard !state.isScrubbing && !showVolumePopover else { return }
         
         controlsTimer = Timer.scheduledTimer(withTimeInterval: LayoutConstants.autoHideDelay, repeats: false) { _ in
             Task { @MainActor in
-                withAnimation { showControls = false }
+                withAnimation(.easeIn(duration: 0.25)) { showControls = false }
             }
         }
-    }
-    
-    private func startCursorHideTimer() {
-        cursorHideTimer?.invalidate()
-        guard state.isFullScreen else { return }
         
-        cursorHideTimer = Timer.scheduledTimer(withTimeInterval: LayoutConstants.autoHideDelay, repeats: false) { _ in
-            Task { @MainActor in
-                guard state.isFullScreen, !state.isScrubbing, !showVolumePopover else { return }
-                if !isCursorHidden {
-                    NSCursor.hide()
-                    isCursorHidden = true
+        if state.isFullScreen {
+            cursorHideTimer = Timer.scheduledTimer(withTimeInterval: LayoutConstants.autoHideDelay, repeats: false) { _ in
+                Task { @MainActor in
+                    guard state.isFullScreen, !state.isScrubbing, !showVolumePopover else { return }
+                    if !isCursorHidden {
+                        NSCursor.hide()
+                        isCursorHidden = true
+                    }
                 }
             }
         }
