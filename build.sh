@@ -1,17 +1,25 @@
-swiftc -O -parse-as-library -framework AVKit -framework AppKit main.swift -o simpleslideshow
+#!/bin/bash
+
+# Set deployment target (e.g. 26.0 for macOS Ventura or higher)
+export MACOSX_DEPLOYMENT_TARGET=26.0
+ARCH=$(uname -m)
+
+# Compile binary with explicit deployment target
+swiftc -O -parse-as-library \
+  -target "${ARCH}-apple-macosx26.0" \
+  -framework AVKit \
+  -framework AppKit \
+  main.swift -o simpleslideshow
 
 mkdir -p "Simple Slideshow.app/Contents/MacOS"
 mkdir -p "Simple Slideshow.app/Contents/Resources"
 
-# Move the compiled binary into MacOS/ and rename it to match your Info.plist executable name
 mv simpleslideshow "Simple Slideshow.app/Contents/MacOS/simpleslideshow"
-
-# Save your XML configuration text into Info.plist and place it inside Contents/
-# (Make sure your Info.plist file is saved in your current working directory first)
 cp Info.plist "Simple Slideshow.app/Contents/Info.plist"
 
-# Move your icon file into Resources/
-cp app_icon.icns "Simple Slideshow.app/Contents/Resources/app_icon.icns"
+if [ -f app_icon.icns ]; then
+  cp app_icon.icns "Simple Slideshow.app/Contents/Resources/app_icon.icns"
+fi
 
 chmod +x "Simple Slideshow.app/Contents/MacOS/simpleslideshow"
 codesign --force --deep --sign - "Simple Slideshow.app"
