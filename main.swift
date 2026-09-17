@@ -367,6 +367,7 @@ final class PiPManager {
             defer: false
         )
         panel.level = .floating
+        panel.isMovable = true
         panel.isMovableByWindowBackground = true
         panel.hidesOnDeactivate = false
         panel.backgroundColor = .clear
@@ -616,6 +617,7 @@ final class AppState: ObservableObject {
     @Published var totalDocumentPages: Int = 1
     
     @Published var isSlideshowActive: Bool = false
+    @Published var isZoomed: Bool = false
     @Published var isPaused: Bool = false
     @Published var delaySeconds: Int = 5
     @Published var videoVolume: Double = 1.0 {
@@ -673,6 +675,11 @@ final class AppState: ObservableObject {
         return items[selectedIndex]
     }
     
+    func toggleZoom() {
+        triggerControls()
+        isZoomed.toggle()
+    }
+    
     func resetVideoState() {
         isScrubbing = false
         scrubTargetTime = nil
@@ -706,6 +713,7 @@ final class AppState: ObservableObject {
         
         if isSlideshowActive {
             isSlideshowActive = false
+            isZoomed = false
             timer?.invalidate()
             resetVideoState()
         }
@@ -747,7 +755,6 @@ final class AppState: ObservableObject {
         isLoadingDirectory = true
         defer { 
             isLoadingDirectory = false 
-            // Double check window mode after loading complete
             if !isSlideshowActive && currentFolder != nil {
                 WindowManager.updateWindowForMode(.browser)
             }
@@ -843,6 +850,7 @@ final class AppState: ObservableObject {
         
         WindowManager.updateWindowForMode(.slideshow)
         resetVideoState()
+        isZoomed = false
         isSlideshowActive = true
         isPaused = false
         currentDocumentPage = 0
@@ -859,6 +867,7 @@ final class AppState: ObservableObject {
     
     func exitSlideshow() {
         isSlideshowActive = false
+        isZoomed = false
         timer?.invalidate()
         resetVideoState()
         NSCursor.unhide()
@@ -1063,7 +1072,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.backgroundColor = .windowBackgroundColor
             window.delegate = self
             
-            // Bypass dropzone window if launched with a dropped folder/file
             let initialMode: WindowInteractionMode = (pendingURL != nil) ? .browser : .dropzone
             WindowManager.updateWindowForMode(initialMode)
         }
@@ -1124,6 +1132,7 @@ struct MediaSlideContentView: View {
     let item: MediaItem
     let pageIndex: Int
     @ObservedObject var playerViewModel: PlayerViewModel
+    var isZoomed: Bool = false
 
     var body: some View {
         Group {
@@ -1131,17 +1140,36 @@ struct MediaSlideContentView: View {
                 AudioSlideView(url: item.url)
                     .id(item.id)
             } else if item.isVideo {
-                SharedVideoView(viewModel: playerViewModel, gravity: .resizeAspect)
+                SharedVideoView(viewModel: playerViewModel, gravity: isZoomed ? .resizeAspectFill : .resizeAspect)
                     .id(item.id)
             } else if item.isPDF {
                 PDFSlideView(url: item.url, pageIndex: pageIndex)
                     .id("\(item.id)_p\(pageIndex)")
             } else {
-                PhotoSlideView(url: item.url)
+                PhotoSlideView(url: item.url, isZoomed: isZoomed)
                     .id(item.id)
             }
         }
     }
+}
+
+// MARK: - Window Drag Bridge
+struct WindowDragView: NSViewRepresentable {
+    class DragView: NSView {
+        override var mouseDownCanMoveWindow: Bool {
+            return true
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            window?.performDrag(with: event)
+        }
+    }
+
+    func makeNSView(context: Context) -> DragView {
+        DragView()
+    }
+
+    func updateNSView(_ nsView: DragView, context: Context) {}
 }
 
 // MARK: - Picture-in-Picture Container View
@@ -1156,27 +1184,26 @@ struct PiPContainerView: View {
                 MediaSlideContentView(
                     item: current,
                     pageIndex: state.currentDocumentPage,
-                    playerViewModel: state.sharedPlayerViewModel
+                    playerViewModel: state.sharedPlayerViewModel,
+                    isZoomed: state.isZoomed
                 )
             }
+            
+            WindowDragView()
             
             if isHovered {
                 VStack {
                     HStack {
                         Spacer()
                         Button(action: { PiPManager.shared.closePiP(state: state) }) {
-                            Image(systemName: "xmark.circle.fill")
+                            Image(systemName: "pip.exit")
                                 .font(.title2)
-                                .symbolRenderingMode(.palette)
-                                .foregroundStyle(
-                                    state.isDarkMode ? Color.white : Color.black,
-                                    state.isDarkMode ? Color.black.opacity(0.7) : Color.white.opacity(0.9)
-                                )
-                                .shadow(color: state.isDarkMode ? .black.opacity(0.3) : .white.opacity(0.3), radius: 2)
+                                .foregroundColor(.white)
+                                .shadow(color: .black.opacity(0.5), radius: 2)
                         }
                         .buttonStyle(.plain)
                         .padding(10)
-                        .help("Exit Picture-in-Picture")
+                        .help("Exit Picture-in-Picture (Esc)")
                     }
                     
                     Spacer()
@@ -1204,6 +1231,7 @@ struct PiPContainerView: View {
                         }
                         .buttonStyle(.plain)
                         .padding(.bottom, 20)
+                        .help(state.isPaused ? "Play (Space)" : "Pause (Space)")
                     }
                 }
                 .transition(.opacity)
@@ -1282,10 +1310,12 @@ struct AudioSlideView: View {
 
 struct PhotoSlideView: View {
     let url: URL
+    var isZoomed: Bool = false
     @State private var image: NSImage?
     
-    init(url: URL) {
+    init(url: URL, isZoomed: Bool = false) {
         self.url = url
+        self.isZoomed = isZoomed
         let fullKey = ThumbnailCache.fullKey(for: url)
         let thumbKey = ThumbnailCache.key(for: url)
         let cached = ThumbnailCache.shared.object(forKey: fullKey) ?? ThumbnailCache.shared.object(forKey: thumbKey)
@@ -1299,8 +1329,9 @@ struct PhotoSlideView: View {
                 if let image = image {
                     Image(nsImage: image)
                         .resizable()
-                        .aspectRatio(contentMode: .fit)
+                        .aspectRatio(contentMode: isZoomed ? .fill : .fit)
                         .frame(width: geometry.size.width, height: geometry.size.height)
+                        .clipped()
                 } else {
                     ProgressView()
                 }
@@ -1407,6 +1438,7 @@ struct DropzoneView: View {
                 }
                 .buttonStyle(.plain)
                 .padding()
+                .help("Toggle Theme")
             }
             Text("📁").font(.system(size: 80))
             Text("Drop Media or Folders Here").font(.largeTitle.bold())
@@ -1423,6 +1455,7 @@ struct DropzoneView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
+            .help("Open Folder Selection Panel")
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1567,7 +1600,7 @@ struct GalleryView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.regular)
-                    .help("Back to previous folder (Esc)")
+                    .help("Back to Previous Folder (Esc)")
                 }
                 
                 Text("📁 \(state.currentFolder?.lastPathComponent ?? "Gallery")")
@@ -1579,7 +1612,7 @@ struct GalleryView: View {
                     Image(systemName: state.isFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                 }
                 .buttonStyle(.plain)
-                .help("Toggle Fullscreen")
+                .help("Toggle Fullscreen (F)")
                 
                 Button(action: { state.isDarkMode.toggle() }) {
                     Image(systemName: state.isDarkMode ? "sun.max.fill" : "moon.fill")
@@ -1711,7 +1744,7 @@ struct VolumeControlView: View {
                     .font(.body)
             }
             .buttonStyle(.plain)
-            .help("Volume Settings")
+            .help("Volume Controls (Up/Down Arrow)")
             .popover(isPresented: $showVolumePopover, arrowEdge: .top) {
                 VStack(spacing: 8) {
                     Text("Volume: \(Int((state.videoVolume * 100).rounded()))%")
@@ -1802,7 +1835,7 @@ struct SlideshowControlBar: View {
                 Image(systemName: "backward.end.fill")
             }
             .buttonStyle(.plain)
-            .help("Previous Item")
+            .help("Previous Item (Left Arrow)")
             
             Button(action: {
                 state.isPaused.toggle()
@@ -1818,13 +1851,13 @@ struct SlideshowControlBar: View {
                 Image(systemName: state.isPaused ? "play.fill" : "pause.fill")
             }
             .buttonStyle(.plain)
-            .help(state.isPaused ? "Play" : "Pause")
+            .help(state.isPaused ? "Play (Space)" : "Pause (Space)")
             
             Button(action: { state.moveSlideshowSelection(by: 1) }) {
                 Image(systemName: "forward.end.fill")
             }
             .buttonStyle(.plain)
-            .help("Next Item")
+            .help("Next Item (Right Arrow)")
         }
     }
 
@@ -1849,6 +1882,14 @@ struct SlideshowControlBar: View {
     @ViewBuilder
     private var utilityButtons: some View {
         Group {
+            if !(state.selectedItem?.isPDF ?? false) {
+                Button(action: { state.toggleZoom() }) {
+                    Image(systemName: state.isZoomed ? "minus.magnifyingglass" : "plus.magnifyingglass")
+                }
+                .buttonStyle(.plain)
+                .help("Toggle Zoom (Z)")
+            }
+
             if !state.isFullScreen {
                 Button(action: { PiPManager.shared.togglePiP(for: state) }) {
                     Image(systemName: "pip.enter")
@@ -1861,10 +1902,11 @@ struct SlideshowControlBar: View {
                 Image(systemName: state.isFullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
             }
             .buttonStyle(.plain)
-            .help("Toggle Fullscreen")
+            .help("Toggle Fullscreen (F)")
             
             Button("✕ Exit") { state.exitSlideshow() }
                 .buttonStyle(.plain)
+                .help("Exit Slideshow (Esc)")
         }
     }
 }
@@ -1901,7 +1943,8 @@ struct SlideshowView: View {
                     MediaSlideContentView(
                         item: current,
                         pageIndex: state.currentDocumentPage,
-                        playerViewModel: playerViewModel
+                        playerViewModel: playerViewModel,
+                        isZoomed: state.isZoomed
                     )
                 }
                 
@@ -1926,7 +1969,12 @@ struct SlideshowView: View {
             case .active:
                 handleMouseActivity()
             case .ended:
-                break
+                if !state.isScrubbing && !showVolumePopover {
+                    controlsTimer?.invalidate()
+                    withAnimation(.easeIn(duration: 0.25)) {
+                        showControls = false
+                    }
+                }
             }
         }
         .onAppear {
@@ -2024,6 +2072,11 @@ enum KeyCommandHandler {
         
         if characters == "p" {
             PiPManager.shared.togglePiP(for: state)
+            return nil
+        }
+
+        if characters == "z" && state.isSlideshowActive {
+            state.toggleZoom()
             return nil
         }
         
