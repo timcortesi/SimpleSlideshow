@@ -103,6 +103,11 @@ enum WindowManager {
         guard let window = primaryWindow else { return }
         let layoutSpec = spec(for: mode)
         
+        window.styleMask.insert(.fullSizeContentView)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        
         if mode == .dropzone && window.styleMask.contains(.fullScreen) {
             window.toggleFullScreen(nil)
         }
@@ -118,6 +123,20 @@ enum WindowManager {
         
         if !window.styleMask.contains(.fullScreen) {
             window.setContentSize(NSSize(width: layoutSpec.width, height: layoutSpec.height))
+        }
+    }
+
+    static func setTrafficLightsVisible(_ visible: Bool, animated: Bool = true) {
+        guard let window = primaryWindow,
+              let container = window.standardWindowButton(.closeButton)?.superview else { return }
+        
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.25
+                container.animator().alphaValue = visible ? 1.0 : 0.0
+            }
+        } else {
+            container.alphaValue = visible ? 1.0 : 0.0
         }
     }
 }
@@ -871,6 +890,7 @@ final class AppState: ObservableObject {
         timer?.invalidate()
         resetVideoState()
         NSCursor.unhide()
+        WindowManager.setTrafficLightsVisible(true, animated: false)
         PiPManager.shared.closePiP(state: self)
         
         if let folder = currentFolder {
@@ -1067,9 +1087,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         closeExtraWindows()
         
         if let window = WindowManager.primaryWindow {
+            window.styleMask.insert(.fullSizeContentView)
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
-            window.backgroundColor = .windowBackgroundColor
+            window.isMovableByWindowBackground = true
+            window.backgroundColor = .clear
             window.delegate = self
             
             let initialMode: WindowInteractionMode = (pendingURL != nil) ? .browser : .dropzone
@@ -1621,6 +1643,7 @@ struct GalleryView: View {
                 .help("Toggle Theme")
             }
             .padding()
+            .padding(.top, 28)
             
             if let error = state.errorMessage {
                 Text(error)
@@ -1964,6 +1987,9 @@ struct SlideshowView: View {
             }
         }
         .environment(\.colorScheme, .dark)
+        .onChange(of: showControls) { _, isVisible in
+            WindowManager.setTrafficLightsVisible(isVisible)
+        }
         .onContinuousHover { phase in
             switch phase {
             case .active:
@@ -1979,11 +2005,13 @@ struct SlideshowView: View {
         }
         .onAppear {
             showControls = true
+            WindowManager.setTrafficLightsVisible(true, animated: false)
             NSCursor.unhide()
             isCursorHidden = false
             resetAutoHideTimers()
         }
         .onDisappear {
+            WindowManager.setTrafficLightsVisible(true, animated: false)
             NSCursor.unhide()
             cursorHideTimer?.invalidate()
             controlsTimer?.invalidate()
@@ -2181,6 +2209,7 @@ struct ContentView: View {
                 DropzoneView(state: state)
             }
         }
+        .ignoresSafeArea()
         .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
