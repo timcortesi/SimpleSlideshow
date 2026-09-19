@@ -9,7 +9,7 @@ import PDFKit
 // MARK: - Constants & Layout Configuration
 enum LayoutConstants {
     static let dropzoneWidth: CGFloat = 400
-    static let dropzoneHeight: CGFloat = 350
+    static let dropzoneHeight: CGFloat = 300
     static let browserWidth: CGFloat = 1120
     static let browserHeight: CGFloat = 776
     static let cardWidth: CGFloat = 264
@@ -181,7 +181,7 @@ final class ThumbnailCache {
     }
 }
 
-// MARK: - Async Image Loader with Concurrency Limiter
+// MARK: - Async Image Loader with LIFO Priority Concurrency Limiter
 actor ImageLoader {
     static let shared = ImageLoader()
     
@@ -200,7 +200,8 @@ actor ImageLoader {
 
     private func releaseSemaphore() {
         if !pendingContinuations.isEmpty {
-            let next = pendingContinuations.removeFirst()
+            // LIFO popping gives precedence to newly scrolled-into-view items
+            let next = pendingContinuations.removeLast()
             next.resume()
         } else {
             activeRequests = max(0, activeRequests - 1)
@@ -208,15 +209,25 @@ actor ImageLoader {
     }
     
     func loadThumbnail(for item: MediaItem, size: CGSize) async -> NSImage? {
+        if Task.isCancelled { return nil }
+        
         let key = ThumbnailCache.key(for: item.url)
         if let cached = ThumbnailCache.shared.object(forKey: key) {
             return cached
         }
         
         await acquireSemaphore()
+        if Task.isCancelled {
+            releaseSemaphore()
+            return nil
+        }
         defer { releaseSemaphore() }
 
+        if Task.isCancelled { return nil }
+
         return await Task.detached(priority: .userInitiated) { () -> NSImage? in
+            if Task.isCancelled { return nil }
+            
             let didStart = item.url.startAccessingSecurityScopedResource()
             defer { if didStart { item.url.stopAccessingSecurityScopedResource() } }
             
@@ -280,6 +291,32 @@ actor ImageLoader {
             }
             
             let scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
+            
+            if item.isVideo {
+                let request = QLThumbnailGenerator.Request(
+                    fileAt: item.url,
+                    size: size,
+                    scale: scale,
+                    representationTypes: .thumbnail
+                )
+                
+                do {
+                    let representation = try await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
+                    let image = representation.nsImage
+                    let cost = Int(image.size.width * image.size.height * 4 * scale)
+                    ThumbnailCache.shared.setObject(image, forKey: key, cost: cost)
+                    return image
+                } catch {
+                    // QuickLook failed -> Fallback to extracting frame via AVAssetImageGenerator
+                    if let frameImage = await ImageLoader.generateVideoFrameThumbnail(for: item.url, targetSize: size) {
+                        let cost = Int(frameImage.size.width * frameImage.size.height * 4)
+                        ThumbnailCache.shared.setObject(frameImage, forKey: key, cost: cost)
+                        return frameImage
+                    }
+                    return nil
+                }
+            }
+            
             let request = QLThumbnailGenerator.Request(
                 fileAt: item.url,
                 size: size,
@@ -305,6 +342,45 @@ actor ImageLoader {
         }.value
     }
     
+    nonisolated static func generateVideoFrameThumbnail(for url: URL, targetSize: CGSize) async -> NSImage? {
+        let asset = AVURLAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        
+        let maxDim = max(targetSize.width, targetSize.height) * 2.0
+        generator.maximumSize = CGSize(width: maxDim, height: maxDim)
+        
+        let candidateTimes: [CMTime] = [
+            .zero,
+            CMTime(seconds: 0.1, preferredTimescale: 600),
+            CMTime(seconds: 0.5, preferredTimescale: 600),
+            CMTime(seconds: 1.0, preferredTimescale: 600),
+            CMTime(seconds: 2.0, preferredTimescale: 600)
+        ]
+        
+        // Pass 1: Positive infinity tolerance to handle missing keyframe indexes or corrupted keyframe tables
+        generator.requestedTimeToleranceBefore = .positiveInfinity
+        generator.requestedTimeToleranceAfter = .positiveInfinity
+        
+        for time in candidateTimes {
+            if let (cgImage, _) = try? await generator.image(at: time) {
+                return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+            }
+        }
+        
+        // Pass 2: Exact zero tolerance fallback
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        
+        for time in candidateTimes {
+            if let (cgImage, _) = try? await generator.image(at: time) {
+                return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+            }
+        }
+        
+        return nil
+    }
+
     nonisolated static func loadFullImageSync(from url: URL) -> NSImage? {
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
@@ -1513,6 +1589,7 @@ struct GalleryCardView: View {
     let action: () -> Void
     @State private var thumbnail: NSImage?
     @State private var isHovered: Bool = false
+    @State private var hasAttemptedLoad: Bool = false
     
     init(item: MediaItem, isSelected: Bool, isDarkMode: Bool, action: @escaping () -> Void) {
         self.item = item
@@ -1520,7 +1597,9 @@ struct GalleryCardView: View {
         self.isDarkMode = isDarkMode
         self.action = action
         let key = ThumbnailCache.key(for: item.url)
-        _thumbnail = State(initialValue: ThumbnailCache.shared.object(forKey: key))
+        let cached = ThumbnailCache.shared.object(forKey: key)
+        _thumbnail = State(initialValue: cached)
+        _hasAttemptedLoad = State(initialValue: cached != nil)
     }
     
     var body: some View {
@@ -1559,6 +1638,10 @@ struct GalleryCardView: View {
                             Image(nsImage: thumbnail)
                                 .resizable()
                                 .aspectRatio(contentMode: .fit)
+                        } else if hasAttemptedLoad {
+                            Image(systemName: "film")
+                                .font(.system(size: 40))
+                                .foregroundColor(.secondary)
                         } else {
                             ProgressView()
                         }
@@ -1573,6 +1656,7 @@ struct GalleryCardView: View {
                 .task(id: item.url) {
                     if thumbnail == nil {
                         thumbnail = await ImageLoader.shared.loadThumbnail(for: item, size: CGSize(width: LayoutConstants.thumbnailLargeWidth, height: LayoutConstants.thumbnailLargeHeight))
+                        hasAttemptedLoad = true
                     }
                 }
             } else {
@@ -1582,6 +1666,11 @@ struct GalleryCardView: View {
                             Image(nsImage: thumbnail)
                                 .resizable()
                                 .aspectRatio(contentMode: .fit)
+                                .frame(width: LayoutConstants.thumbnailWidth, height: 160)
+                        } else if hasAttemptedLoad {
+                            Image(systemName: "photo")
+                                .font(.system(size: 40))
+                                .foregroundColor(.secondary)
                                 .frame(width: LayoutConstants.thumbnailWidth, height: 160)
                         } else {
                             ProgressView()
@@ -1596,6 +1685,7 @@ struct GalleryCardView: View {
                 .task(id: item.url) {
                     if thumbnail == nil {
                         thumbnail = await ImageLoader.shared.loadThumbnail(for: item, size: CGSize(width: LayoutConstants.thumbnailLargeWidth, height: 320))
+                        hasAttemptedLoad = true
                     }
                 }
             }
