@@ -660,6 +660,7 @@ final class AppState: ObservableObject {
     @Published var errorMessage: String? = nil
     
     let sharedPlayerViewModel = PlayerViewModel()
+    private var cancellables = Set<AnyCancellable>()
     private var currentPDFDocument: PDFDocument? = nil
     private var activeFolderSecurityScope: URL?
     
@@ -687,6 +688,16 @@ final class AppState: ObservableObject {
                 PiPManager.shared.updatePiPContentSize(for: self)
             }
         }
+
+        sharedPlayerViewModel.$assetNaturalSize
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] newSize in
+                guard let self = self, newSize != nil else { return }
+                if PiPManager.shared.isPiPActive {
+                    PiPManager.shared.updatePiPContentSize(for: self)
+                }
+            }
+            .store(in: &cancellables)
     }
     
     var selectedItem: MediaItem? {
@@ -1197,7 +1208,13 @@ struct WindowDragView: NSViewRepresentable {
 // MARK: - Picture-in-Picture Container View
 struct PiPContainerView: View {
     @ObservedObject var state: AppState
+    @ObservedObject var playerViewModel: PlayerViewModel
     @State private var isHovered = false
+
+    init(state: AppState) {
+        self.state = state
+        self.playerViewModel = state.sharedPlayerViewModel
+    }
 
     var body: some View {
         ZStack {
@@ -1270,7 +1287,7 @@ struct PiPContainerView: View {
                 }
             }
         }
-        .onChange(of: state.sharedPlayerViewModel.assetNaturalSize) { _, newSize in
+        .onChange(of: playerViewModel.assetNaturalSize) { _, newSize in
             if newSize != nil { PiPManager.shared.updatePiPContentSize(for: state) }
         }
         .onChange(of: state.selectedIndex) { _, _ in
