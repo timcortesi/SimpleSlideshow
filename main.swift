@@ -200,7 +200,6 @@ actor ImageLoader {
 
     private func releaseSemaphore() {
         if !pendingContinuations.isEmpty {
-            // LIFO popping gives precedence to newly scrolled-into-view items
             let next = pendingContinuations.removeLast()
             next.resume()
         } else {
@@ -307,7 +306,6 @@ actor ImageLoader {
                     ThumbnailCache.shared.setObject(image, forKey: key, cost: cost)
                     return image
                 } catch {
-                    // QuickLook failed -> Fallback to extracting frame via AVAssetImageGenerator
                     if let frameImage = await ImageLoader.generateVideoFrameThumbnail(for: item.url, targetSize: size) {
                         let cost = Int(frameImage.size.width * frameImage.size.height * 4)
                         ThumbnailCache.shared.setObject(frameImage, forKey: key, cost: cost)
@@ -358,7 +356,6 @@ actor ImageLoader {
             CMTime(seconds: 2.0, preferredTimescale: 600)
         ]
         
-        // Pass 1: Positive infinity tolerance to handle missing keyframe indexes or corrupted keyframe tables
         generator.requestedTimeToleranceBefore = .positiveInfinity
         generator.requestedTimeToleranceAfter = .positiveInfinity
         
@@ -368,7 +365,6 @@ actor ImageLoader {
             }
         }
         
-        // Pass 2: Exact zero tolerance fallback
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
         
@@ -448,6 +444,8 @@ final class PiPManager {
         
         isTransitioning = true
         closePiP(animated: false, state: state)
+
+        state.checkVolumeAndAutoToggleCaptions()
 
         if (currentItem.isVideo || currentItem.isAudio) && state.sharedPlayerViewModel.player == nil {
             state.sharedPlayerViewModel.setupPlayer(for: currentItem.url)
@@ -559,6 +557,11 @@ final class PlayerViewModel: ObservableObject {
     @Published var currentTime: Double = 0
     @Published var duration: Double = 1
     @Published var isScrubbing: Bool = false
+    @Published var areSubtitlesEnabled: Bool = false {
+        didSet {
+            applySubtitlesState()
+        }
+    }
     
     private var endObserver: NSObjectProtocol?
     private var statusObserver: NSKeyValueObservation?
@@ -618,6 +621,8 @@ final class PlayerViewModel: ObservableObject {
         player = newPlayer
         observedPlayer = newPlayer
         
+        applySubtitlesState()
+        
         let interval = CMTime(seconds: LayoutConstants.periodicTimeInterval, preferredTimescale: 600)
         let token = newPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             MainActor.assumeIsolated {
@@ -646,6 +651,25 @@ final class PlayerViewModel: ObservableObject {
         }
         
         newPlayer.play()
+    }
+    
+    func applySubtitlesState() {
+        guard let player = player, let item = player.currentItem else { return }
+        player.appliesMediaSelectionCriteriaAutomatically = false
+        
+        let enabled = areSubtitlesEnabled
+        let asset = item.asset
+        
+        Task { @MainActor in
+            if let group = try? await asset.loadMediaSelectionGroup(for: .legible) {
+                if enabled {
+                    let option = group.defaultOption ?? group.options.first
+                    item.select(option, in: group)
+                } else {
+                    item.select(nil, in: group)
+                }
+            }
+        }
     }
     
     func removeTimeObserver() {
@@ -718,6 +742,12 @@ final class AppState: ObservableObject {
     @Published var videoVolume: Double = 1.0 {
         didSet {
             sharedPlayerViewModel.player?.volume = Float(videoVolume)
+            checkVolumeAndAutoToggleCaptions()
+        }
+    }
+    @Published var areSubtitlesEnabled: Bool = false {
+        didSet {
+            sharedPlayerViewModel.areSubtitlesEnabled = areSubtitlesEnabled
         }
     }
     @Published var gridColumnsCount: Int = 3
@@ -774,6 +804,8 @@ final class AppState: ObservableObject {
                 }
             }
             .store(in: &cancellables)
+            
+        checkVolumeAndAutoToggleCaptions()
     }
     
     var selectedItem: MediaItem? {
@@ -781,9 +813,22 @@ final class AppState: ObservableObject {
         return items[selectedIndex]
     }
     
+    func checkVolumeAndAutoToggleCaptions() {
+        if videoVolume <= 0.10 {
+            if !areSubtitlesEnabled {
+                areSubtitlesEnabled = true
+            }
+        }
+    }
+    
     func toggleZoom() {
         triggerControls()
         isZoomed.toggle()
+    }
+    
+    func toggleSubtitles() {
+        triggerControls()
+        areSubtitlesEnabled.toggle()
     }
     
     func resetVideoState() {
@@ -954,6 +999,8 @@ final class AppState: ObservableObject {
             return
         }
         
+        checkVolumeAndAutoToggleCaptions()
+        
         WindowManager.updateWindowForMode(.slideshow)
         resetVideoState()
         isZoomed = false
@@ -1032,6 +1079,8 @@ final class AppState: ObservableObject {
             exitSlideshow()
             return
         }
+        
+        checkVolumeAndAutoToggleCaptions()
         
         if let current = selectedItem, (current.isVideo || current.isAudio) {
             isPaused = false
@@ -2012,6 +2061,14 @@ struct SlideshowControlBar: View {
     @ViewBuilder
     private var utilityButtons: some View {
         Group {
+            if state.selectedItem?.isVideo == true {
+                Button(action: { state.toggleSubtitles() }) {
+                    Image(systemName: state.areSubtitlesEnabled ? "captions.bubble.fill" : "captions.bubble")
+                }
+                .buttonStyle(.plain)
+                .help("Toggle Subtitles/Captions (S)")
+            }
+
             if !(state.selectedItem?.isPDF ?? false) {
                 Button(action: { state.toggleZoom() }) {
                     Image(systemName: state.isZoomed ? "minus.magnifyingglass" : "plus.magnifyingglass")
@@ -2212,6 +2269,11 @@ enum KeyCommandHandler {
 
         if characters == "z" && state.isSlideshowActive {
             state.toggleZoom()
+            return nil
+        }
+
+        if characters == "s" {
+            state.toggleSubtitles()
             return nil
         }
         
