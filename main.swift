@@ -445,8 +445,6 @@ final class PiPManager {
         isTransitioning = true
         closePiP(animated: false, state: state)
 
-        state.checkVolumeAndAutoToggleCaptions()
-
         if (currentItem.isVideo || currentItem.isAudio) && state.sharedPlayerViewModel.player == nil {
             state.sharedPlayerViewModel.setupPlayer(for: currentItem.url)
             state.sharedPlayerViewModel.player?.volume = Float(state.videoVolume)
@@ -739,10 +737,30 @@ final class AppState: ObservableObject {
     @Published var isZoomed: Bool = false
     @Published var isPaused: Bool = false
     @Published var delaySeconds: Int = 5
+    @Published var isRandomEnabled: Bool = false {
+        didSet {
+            if !isRandomEnabled {
+                clearRandomCache()
+                if isSlideshowActive {
+                    preloadAdjacentItems()
+                }
+            } else if isSlideshowActive, let current = selectedItem, !current.isDirectory {
+                clearRandomCache()
+                randomHistory = [selectedIndex]
+                randomHistoryIndex = 0
+                playedIndices = [selectedIndex]
+                preloadAdjacentItems()
+            }
+        }
+    }
+    
+    private var randomHistory: [Int] = []
+    private var randomHistoryIndex: Int = 0
+    private var playedIndices: Set<Int> = []
+    
     @Published var videoVolume: Double = 1.0 {
         didSet {
             sharedPlayerViewModel.player?.volume = Float(videoVolume)
-            checkVolumeAndAutoToggleCaptions()
         }
     }
     @Published var areSubtitlesEnabled: Bool = false {
@@ -804,21 +822,11 @@ final class AppState: ObservableObject {
                 }
             }
             .store(in: &cancellables)
-            
-        checkVolumeAndAutoToggleCaptions()
     }
     
     var selectedItem: MediaItem? {
         guard items.indices.contains(selectedIndex) else { return nil }
         return items[selectedIndex]
-    }
-    
-    func checkVolumeAndAutoToggleCaptions() {
-        if videoVolume <= 0.10 {
-            if !areSubtitlesEnabled {
-                areSubtitlesEnabled = true
-            }
-        }
     }
     
     func toggleZoom() {
@@ -829,6 +837,34 @@ final class AppState: ObservableObject {
     func toggleSubtitles() {
         triggerControls()
         areSubtitlesEnabled.toggle()
+    }
+    
+    func toggleRandom() {
+        triggerControls()
+        isRandomEnabled.toggle()
+    }
+    
+    func clearRandomCache() {
+        randomHistory.removeAll()
+        randomHistoryIndex = 0
+        playedIndices.removeAll()
+    }
+    
+    private func pickNextRandomIndex() -> Int? {
+        let playableIndices = items.indices.filter { !items[$0].isDirectory }
+        guard !playableIndices.isEmpty else { return nil }
+        
+        var unplayed = playableIndices.filter { !playedIndices.contains($0) }
+        if unplayed.isEmpty {
+            playedIndices.removeAll()
+            if playableIndices.count > 1 {
+                unplayed = playableIndices.filter { $0 != selectedIndex }
+            } else {
+                unplayed = playableIndices
+            }
+        }
+        
+        return unplayed.randomElement()
     }
     
     func resetVideoState() {
@@ -861,6 +897,9 @@ final class AppState: ObservableObject {
         NSCursor.unhide()
         PiPManager.shared.closePiP(state: self)
         errorMessage = nil
+        isRandomEnabled = false
+        areSubtitlesEnabled = false
+        clearRandomCache()
         
         if isSlideshowActive {
             isSlideshowActive = false
@@ -971,6 +1010,9 @@ final class AppState: ObservableObject {
         NSCursor.unhide()
         PiPManager.shared.closePiP(state: self)
         errorMessage = nil
+        isRandomEnabled = false
+        areSubtitlesEnabled = false
+        clearRandomCache()
         if let previousState = folderHistory.popLast() {
             Task {
                 await parseDirectoryAsync(previousState.url, resetIndex: false)
@@ -999,7 +1041,8 @@ final class AppState: ObservableObject {
             return
         }
         
-        checkVolumeAndAutoToggleCaptions()
+        isRandomEnabled = false
+        areSubtitlesEnabled = false
         
         WindowManager.updateWindowForMode(.slideshow)
         resetVideoState()
@@ -1008,6 +1051,8 @@ final class AppState: ObservableObject {
         isPaused = false
         currentDocumentPage = 0
         loadCurrentDocument()
+        
+        clearRandomCache()
         
         if item.isVideo || item.isAudio {
             sharedPlayerViewModel.setupPlayer(for: item.url)
@@ -1021,8 +1066,11 @@ final class AppState: ObservableObject {
     func exitSlideshow() {
         isSlideshowActive = false
         isZoomed = false
+        isRandomEnabled = false
+        areSubtitlesEnabled = false
         timer?.invalidate()
         resetVideoState()
+        clearRandomCache()
         NSCursor.unhide()
         WindowManager.setTrafficLightsVisible(true, animated: false)
         PiPManager.shared.closePiP(state: self)
@@ -1051,16 +1099,48 @@ final class AppState: ObservableObject {
         }
         
         var newIndex = selectedIndex
-        let count = items.count
         
-        for _ in 0..<count {
-            newIndex += delta
-            if newIndex >= count {
-                newIndex = 0
-            } else if newIndex < 0 {
-                newIndex = count - 1
+        if isRandomEnabled {
+            if randomHistory.isEmpty {
+                randomHistory = [selectedIndex]
+                randomHistoryIndex = 0
+                playedIndices = [selectedIndex]
             }
-            if !items[newIndex].isDirectory { break }
+            
+            if delta < 0 {
+                let targetHistoryIndex = randomHistoryIndex + delta
+                if targetHistoryIndex >= 0 {
+                    randomHistoryIndex = targetHistoryIndex
+                    newIndex = randomHistory[randomHistoryIndex]
+                } else {
+                    randomHistoryIndex = 0
+                    newIndex = randomHistory[0]
+                }
+            } else if delta > 0 {
+                let targetHistoryIndex = randomHistoryIndex + delta
+                if targetHistoryIndex < randomHistory.count {
+                    randomHistoryIndex = targetHistoryIndex
+                    newIndex = randomHistory[randomHistoryIndex]
+                } else {
+                    if let nextRandom = pickNextRandomIndex() {
+                        randomHistory.append(nextRandom)
+                        randomHistoryIndex = randomHistory.count - 1
+                        playedIndices.insert(nextRandom)
+                        newIndex = nextRandom
+                    }
+                }
+            }
+        } else {
+            let count = items.count
+            for _ in 0..<count {
+                newIndex += delta
+                if newIndex >= count {
+                    newIndex = 0
+                } else if newIndex < 0 {
+                    newIndex = count - 1
+                }
+                if !items[newIndex].isDirectory { break }
+            }
         }
         
         if let oldItem = selectedItem, (oldItem.isVideo || oldItem.isAudio) {
@@ -1079,8 +1159,6 @@ final class AppState: ObservableObject {
             exitSlideshow()
             return
         }
-        
-        checkVolumeAndAutoToggleCaptions()
         
         if let current = selectedItem, (current.isVideo || current.isAudio) {
             isPaused = false
@@ -1183,10 +1261,33 @@ final class AppState: ObservableObject {
     private func preloadAdjacentItems() {
         guard isSlideshowActive, !items.isEmpty else { return }
         let count = items.count
-        let nextIndex = (selectedIndex + 1) % count
-        let prevIndex = (selectedIndex - 1 + count) % count
+        let nextIndex: Int
+        let prevIndex: Int
+        
+        if isRandomEnabled {
+            if randomHistory.isEmpty {
+                randomHistory = [selectedIndex]
+                randomHistoryIndex = 0
+                playedIndices = [selectedIndex]
+            }
+            
+            // Pre-plan the next random item if we are at the end of current history
+            if randomHistoryIndex + 1 >= randomHistory.count {
+                if let nextRandom = pickNextRandomIndex() {
+                    randomHistory.append(nextRandom)
+                    playedIndices.insert(nextRandom)
+                }
+            }
+            
+            nextIndex = (randomHistoryIndex + 1 < randomHistory.count) ? randomHistory[randomHistoryIndex + 1] : selectedIndex
+            prevIndex = (randomHistoryIndex > 0) ? randomHistory[randomHistoryIndex - 1] : selectedIndex
+        } else {
+            nextIndex = (selectedIndex + 1) % count
+            prevIndex = (selectedIndex - 1 + count) % count
+        }
         
         for idx in [nextIndex, prevIndex] {
+            guard idx >= 0 && idx < items.count else { continue }
             let item = items[idx]
             if !item.isDirectory && !item.isVideo && !item.isAudio {
                 let url = item.url
@@ -2061,12 +2162,21 @@ struct SlideshowControlBar: View {
     @ViewBuilder
     private var utilityButtons: some View {
         Group {
+            Button(action: { state.toggleRandom() }) {
+                Image(systemName: "shuffle")
+                    .foregroundColor(state.isRandomEnabled ? .black : .white)
+                    .padding(4)
+                    .background(Circle().fill(state.isRandomEnabled ? Color.white : Color.clear))
+            }
+            .buttonStyle(.plain)
+            .help("Toggle Random (R)")
+
             if state.selectedItem?.isVideo == true {
                 Button(action: { state.toggleSubtitles() }) {
                     Image(systemName: state.areSubtitlesEnabled ? "captions.bubble.fill" : "captions.bubble")
                 }
                 .buttonStyle(.plain)
-                .help("Toggle Subtitles/Captions (S)")
+                .help("Toggle Subtitles/Captions (S/C)")
             }
 
             if !(state.selectedItem?.isPDF ?? false) {
@@ -2119,12 +2229,6 @@ struct SlideshowView: View {
         GeometryReader { proxy in
             ZStack {
                 Color.black.edgesIgnoringSafeArea(.all)
-                    .onTapGesture(count: 2) {
-                        state.toggleFullScreen()
-                    }
-                    .onTapGesture(count: 1) {
-                        handleMouseActivity()
-                    }
                 
                 if let current = state.selectedItem, !current.isDirectory {
                     MediaSlideContentView(
@@ -2133,7 +2237,17 @@ struct SlideshowView: View {
                         playerViewModel: playerViewModel,
                         isZoomed: state.isZoomed
                     )
+                    .allowsHitTesting(false)
                 }
+                
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        state.toggleFullScreen()
+                    }
+                    .onTapGesture(count: 1) {
+                        handleMouseActivity()
+                    }
                 
                 if showControls {
                     VStack {
@@ -2272,8 +2386,13 @@ enum KeyCommandHandler {
             return nil
         }
 
-        if characters == "s" {
+        if characters == "s" || characters == "c" {
             state.toggleSubtitles()
+            return nil
+        }
+
+        if characters == "r" {
+            state.toggleRandom()
             return nil
         }
         
